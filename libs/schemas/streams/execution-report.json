@@ -1,0 +1,72 @@
+{
+  "$id": "https://schemas.local/streams/execution-report.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionReportEvent",
+  "allOf": [
+    {
+      "$ref": "https://schemas.local/common/event-envelope.json"
+    }
+  ],
+  "properties": {
+    "payload": {
+      "type": "object",
+      "required": [
+        "plan_id",
+        "status"
+      ],
+      "properties": {
+        "plan_id": {
+          "type": "string"
+        },
+        "order_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ORDER_SUBMITTED",
+            "ORDER_REJECTED",
+            "PARTIAL_FILLED",
+            "FILLED",
+            "TP_HIT",
+            "PRIMARY_SL_HIT",
+            "SECONDARY_SL_EXIT",
+            "POSITION_CLOSED"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "filled_qty": {
+          "type": "number",
+          "minimum": 0
+        },
+        "avg_price": {
+          "type": "number",
+          "minimum": 0
+        },
+        "symbol": {
+          "type": "string"
+        },
+        "timeframe": {
+          "$ref": "https://schemas.local/common/timeframe.json"
+        },
+        "latency_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "slippage_bps": {
+          "type": "number"
+        },
+        "retry_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ext": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

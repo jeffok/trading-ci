@@ -1,0 +1,30 @@
+services:
+  marketdata:
+    build: .
+    env_file: .env
+    command: ["python", "-m", "services.marketdata.main"]
+    ports: ["8001:8000"]
+
+  strategy:
+    build: .
+    env_file: .env
+    command: ["python", "-m", "services.strategy.main"]
+    ports: ["8002:8000"]
+
+  execution:
+    build: .
+    env_file: .env
+    command: ["python", "-m", "services.execution.main"]
+    ports: ["8003:8000"]
+
+  notifier:
+    build: .
+    env_file: .env
+    command: ["python", "-m", "services.notifier.main"]
+    ports: ["8004:8000"]
+
+  api:
+    build: .
+    env_file: .env
+    command: ["python", "-m", "services.api.main"]
+    ports: ["8000:8000"]

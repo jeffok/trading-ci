@@ -1,0 +1,59 @@
+{
+  "$id": "https://schemas.local/common/event-envelope.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EventEnvelope",
+  "type": "object",
+  "required": [
+    "event_id",
+    "ts_ms",
+    "env",
+    "service"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "minLength": 8
+    },
+    "ts_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "env": {
+      "type": "string",
+      "enum": [
+        "dev",
+        "staging",
+        "prod"
+      ]
+    },
+    "service": {
+      "type": "string",
+      "enum": [
+        "marketdata-service",
+        "strategy-service",
+        "execution-service",
+        "notifier-service",
+        "api-service"
+      ]
+    },
+    "trace_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "meta": {
+      "type": "object",
+      "description": "可选元信息：路由、版本、来源、延迟等"
+    },
+    "payload": {
+      "type": "object"
+    },
+    "ext": {
+      "type": "object",
+      "description": "可选扩展字段容器：前向兼容"
+    }
+  },
+  "additionalProperties": false
+}

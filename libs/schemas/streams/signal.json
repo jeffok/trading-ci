@@ -1,0 +1,137 @@
+{
+  "$id": "https://schemas.local/streams/signal.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SignalEvent",
+  "allOf": [
+    {
+      "$ref": "https://schemas.local/common/event-envelope.json"
+    }
+  ],
+  "properties": {
+    "payload": {
+      "type": "object",
+      "required": [
+        "symbol",
+        "timeframe",
+        "close_time_ms",
+        "bias",
+        "vegas_state",
+        "confirmations"
+      ],
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "pattern": "^[A-Z0-9]{3,12}USDT$"
+        },
+        "timeframe": {
+          "$ref": "https://schemas.local/common/timeframe.json"
+        },
+        "close_time_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "setup_id": {
+          "type": "string"
+        },
+        "trigger_id": {
+          "type": "string"
+        },
+        "bias": {
+          "type": "string",
+          "enum": [
+            "LONG",
+            "SHORT"
+          ]
+        },
+        "vegas_state": {
+          "type": "string",
+          "enum": [
+            "Bullish",
+            "Bearish",
+            "Neutral"
+          ]
+        },
+        "confirmations": {
+          "type": "object",
+          "required": [
+            "min_required",
+            "hit_count",
+            "hits"
+          ],
+          "properties": {
+            "min_required": {
+              "type": "integer",
+              "enum": [
+                2
+              ]
+            },
+            "hit_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "hits": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "ENGULFING",
+                  "RSI_DIV",
+                  "OBV_DIV",
+                  "FVG_PROXIMITY"
+                ]
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "lifecycle": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "PENDING_CONFIRM",
+                "CONFIRMED",
+                "PLANNED",
+                "EXECUTED",
+                "EXPIRED",
+                "CANCELLED"
+              ]
+            },
+            "valid_from_ms": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "expires_at_ms": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "signal_score": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "divergence_strength": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "market_state": {
+          "type": "string",
+          "enum": [
+            "NORMAL",
+            "HIGH_VOL",
+            "NEWS_WINDOW"
+          ]
+        },
+        "ext": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,76 @@
+{
+  "$id": "https://schemas.local/streams/bar-close.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BarCloseEvent",
+  "allOf": [
+    {
+      "$ref": "https://schemas.local/common/event-envelope.json"
+    }
+  ],
+  "required": [
+    "event_id",
+    "ts_ms",
+    "env",
+    "service",
+    "payload"
+  ],
+  "properties": {
+    "payload": {
+      "type": "object",
+      "required": [
+        "symbol",
+        "timeframe",
+        "close_time_ms"
+      ],
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "pattern": "^[A-Z0-9]{3,12}USDT$"
+        },
+        "timeframe": {
+          "$ref": "https://schemas.local/common/timeframe.json"
+        },
+        "close_time_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "is_final": {
+          "type": "boolean"
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "bybit_ws",
+            "bybit_rest"
+          ]
+        },
+        "ohlcv": {
+          "type": "object",
+          "properties": {
+            "open": {
+              "type": "number"
+            },
+            "high": {
+              "type": "number"
+            },
+            "low": {
+              "type": "number"
+            },
+            "close": {
+              "type": "number"
+            },
+            "volume": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "ext": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

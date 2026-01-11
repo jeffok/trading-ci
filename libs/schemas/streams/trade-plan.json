@@ -1,0 +1,219 @@
+{
+  "$id": "https://schemas.local/streams/trade-plan.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TradePlanEvent",
+  "allOf": [
+    {
+      "$ref": "https://schemas.local/common/event-envelope.json"
+    }
+  ],
+  "properties": {
+    "payload": {
+      "type": "object",
+      "required": [
+        "plan_id",
+        "idempotency_key",
+        "symbol",
+        "timeframe",
+        "side",
+        "entry_price",
+        "primary_sl_price",
+        "tp_rules",
+        "secondary_sl_rule",
+        "traceability"
+      ],
+      "properties": {
+        "plan_id": {
+          "type": "string"
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 8
+        },
+        "symbol": {
+          "type": "string",
+          "pattern": "^[A-Z0-9]{3,12}USDT$"
+        },
+        "timeframe": {
+          "$ref": "https://schemas.local/common/timeframe.json"
+        },
+        "side": {
+          "type": "string",
+          "enum": [
+            "BUY",
+            "SELL"
+          ]
+        },
+        "entry_price": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "primary_sl_price": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "tp_rules": {
+          "type": "object",
+          "required": [
+            "tp1",
+            "tp2",
+            "tp3_trail"
+          ],
+          "properties": {
+            "tp1": {
+              "type": "object",
+              "required": [
+                "r",
+                "pct"
+              ],
+              "properties": {
+                "r": {
+                  "type": "number",
+                  "enum": [
+                    1.0
+                  ]
+                },
+                "pct": {
+                  "type": "number",
+                  "enum": [
+                    0.4
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            "tp2": {
+              "type": "object",
+              "required": [
+                "r",
+                "pct"
+              ],
+              "properties": {
+                "r": {
+                  "type": "number",
+                  "enum": [
+                    2.0
+                  ]
+                },
+                "pct": {
+                  "type": "number",
+                  "enum": [
+                    0.4
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            "tp3_trail": {
+              "type": "object",
+              "required": [
+                "pct",
+                "mode"
+              ],
+              "properties": {
+                "pct": {
+                  "type": "number",
+                  "enum": [
+                    0.2
+                  ]
+                },
+                "mode": {
+                  "type": "string",
+                  "enum": [
+                    "ATR",
+                    "PIVOT"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            "reduce_only": {
+              "type": "boolean",
+              "enum": [
+                true
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "secondary_sl_rule": {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "NEXT_BAR_NOT_SHORTEN_EXIT"
+              ]
+            }
+          },
+          "additionalProperties": true
+        },
+        "risk_params": {
+          "type": "object",
+          "properties": {
+            "risk_pct": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "max_open_positions_default": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10
+            },
+            "risk_multiplier": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": true
+        },
+        "confluence": {
+          "type": "object",
+          "properties": {
+            "vegas_state": {
+              "type": "string",
+              "enum": [
+                "Bullish",
+                "Bearish",
+                "Neutral"
+              ]
+            },
+            "confirmations": {
+              "$ref": "https://schemas.local/streams/signal.json#/properties/payload/properties/confirmations"
+            },
+            "signal_score": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100
+            }
+          },
+          "additionalProperties": true
+        },
+        "traceability": {
+          "type": "object",
+          "required": [
+            "setup_id",
+            "trigger_id"
+          ],
+          "properties": {
+            "setup_id": {
+              "type": "string"
+            },
+            "trigger_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "ext": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

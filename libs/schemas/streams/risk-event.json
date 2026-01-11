@@ -1,0 +1,59 @@
+{
+  "$id": "https://schemas.local/streams/risk-event.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RiskEvent",
+  "allOf": [
+    {
+      "$ref": "https://schemas.local/common/event-envelope.json"
+    }
+  ],
+  "properties": {
+    "payload": {
+      "type": "object",
+      "required": [
+        "type",
+        "detail"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "RISK_REJECTED",
+            "KILL_SWITCH_ON",
+            "DATA_GAP",
+            "DATA_LAG",
+            "WS_RECONNECT",
+            "RATE_LIMIT",
+            "SIGNAL_CONFLICT",
+            "IDEMPOTENCY_CONFLICT",
+            "POSITION_MUTEX_BLOCKED",
+            "COOLDOWN_BLOCKED",
+            "MAX_POSITIONS_BLOCKED"
+          ]
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "CRITICAL",
+            "IMPORTANT",
+            "INFO"
+          ]
+        },
+        "symbol": {
+          "type": "string"
+        },
+        "retry_after_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "detail": {
+          "type": "object"
+        },
+        "ext": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
