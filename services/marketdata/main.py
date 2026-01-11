@@ -1,14 +1,16 @@
 """
-marketdata-service 入口（Phase 0 骨架）
+marketdata-service 入口（Phase 1）
 
-职责：
-- 提供最小可运行 HTTP 服务（/health）
-- 验证环境变量与依赖连通性（轻量 ping）
-- 为后续 consumer/handler 留出扩展点
+新增：在 FastAPI 启动后启动后台任务 run_marketdata()。
+- Bybit Public WS 订阅 Kline
+- candle 收盘后写库 + 发布 bar_close 事件
+
+保留：/health 供容器编排探测。
 """
 
 from __future__ import annotations
 
+import asyncio
 from fastapi import FastAPI
 import uvicorn
 
@@ -16,21 +18,46 @@ from libs.common.config import settings
 from libs.common.logging import setup_logging
 from libs.mq.redis_streams import RedisStreamsClient
 
+from services.marketdata.worker import run_marketdata
+
 SERVICE_NAME = "marketdata-service"
 logger = setup_logging(SERVICE_NAME)
 
 app = FastAPI(title=SERVICE_NAME)
 
+_bg_task: asyncio.Task | None = None
+
+
+@app.on_event("startup")
+async def _startup():
+    global _bg_task
+    logger.info("startup", extra={"extra_fields": {"event": "SERVICE_START", "env": settings.env}})
+
+    # 轻量依赖探测（不强制失败）
+    try:
+        RedisStreamsClient(settings.redis_url).r.ping()
+    except Exception as e:
+        logger.warning("redis_ping_failed", extra={"extra_fields": {"event": "REDIS_PING_FAILED", "error": str(e)}})
+
+    # 启动后台任务：行情闭环
+    _bg_task = asyncio.create_task(run_marketdata())
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    global _bg_task
+    if _bg_task:
+        _bg_task.cancel()
+
+
 @app.get("/health")
 def health():
-    """健康检查：不做重操作，仅快速探测依赖。"""
     redis_ok = False
     try:
-        client = RedisStreamsClient(settings.redis_url)
-        client.r.ping()
+        RedisStreamsClient(settings.redis_url).r.ping()
         redis_ok = True
-    except Exception as e:
-        logger.warning("redis_ping_failed", extra={"extra_fields": {"event":"REDIS_PING_FAILED","error": str(e)}})
+    except Exception:
+        pass
 
     return {
         "env": settings.env,
@@ -39,9 +66,10 @@ def health():
         "db_url_present": bool(settings.database_url),
     }
 
+
 def main():
-    logger.info("service_start", extra={"extra_fields": {"event":"SERVICE_START","env": settings.env}})
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 if __name__ == "__main__":
     main()

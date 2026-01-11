@@ -1,6 +1,13 @@
-"""时间工具：统一毫秒时间戳"""
+"""Postgres 访问层（极简 psycopg3）"""
 from __future__ import annotations
-import time
+from contextlib import contextmanager
+from typing import Iterator
+import psycopg
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
+@contextmanager
+def get_conn(database_url: str) -> Iterator[psycopg.Connection]:
+    conn = psycopg.connect(database_url)
+    try:
+        yield conn
+    finally:
+        conn.close()
