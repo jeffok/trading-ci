@@ -70,3 +70,7 @@ repo/
 
 ## 4. 版本与变更
 详见：`CHANGELOG.md`
+
+
+## 3. Phase 2：策略引擎（strategy-service）
+- 消费 bar_close，检测三段背离 + 共振门槛，产出 signal 与 trade_plan（仅 1h/4h/1d 自动周期）

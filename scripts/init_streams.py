@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Redis Streams 初始化脚本（幂等）"""
 from __future__ import annotations
 from libs.common.config import settings
