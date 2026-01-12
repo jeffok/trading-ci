@@ -123,3 +123,13 @@ def reconcile(database_url: str, redis_url: str) -> None:
                 hist_entry=p["hist_entry"],
                 meta=meta,
             )
+
+
+# compatibility shim: worker expects this symbol
+
+def run_reconcile_once(database_url: str, redis_url: str) -> None:
+    """Run a single reconcile pass.
+
+    Kept as a thin wrapper for backward-compat with worker imports.
+    """
+    return reconcile(database_url, redis_url)
