@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
-"""execution-service 入口（Phase 3/4）
+"""
+execution-service 入口（Phase 3）
 
-新增：后台 worker
-- trade_plan consumer
-- bar_close consumer（Phase 4）
+使用 FastAPI Lifespan 替代 on_event，避免 DeprecationWarning。
+
+后台任务 run_execution():
+- 消费 stream:trade_plan / stream:bar_close
+- 做 reconcile（启动时/周期性）
+- 生成订单/更新仓位/写DB/发布 risk_event 等
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 import uvicorn
 
@@ -20,27 +27,37 @@ from services.execution.worker import run_execution
 SERVICE_NAME = "execution-service"
 logger = setup_logging(SERVICE_NAME)
 
-app = FastAPI(title=SERVICE_NAME)
-_bg_task: asyncio.Task | None = None
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- startup ---
+    logger.info(
+        "startup",
+        extra={"extra_fields": {"event": "SERVICE_START", "env": settings.env}},
+    )
 
-@app.on_event("startup")
-async def _startup():
-    global _bg_task
-    logger.info("startup", extra={"extra_fields": {"event":"SERVICE_START","env": settings.env, "mode": settings.execution_mode}})
+    # 轻量依赖探测（不强制失败）
     try:
         RedisStreamsClient(settings.redis_url).r.ping()
     except Exception as e:
-        logger.warning("redis_ping_failed", extra={"extra_fields": {"event":"REDIS_PING_FAILED","error": str(e)}})
+        logger.warning(
+            "redis_ping_failed",
+            extra={"extra_fields": {"event": "REDIS_PING_FAILED", "error": str(e)}},
+        )
 
-    _bg_task = asyncio.create_task(run_execution())
+    app.state.bg_task = asyncio.create_task(run_execution())
+
+    yield
+
+    # --- shutdown ---
+    task: asyncio.Task | None = getattr(app.state, "bg_task", None)
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
-@app.on_event("shutdown")
-async def _shutdown():
-    global _bg_task
-    if _bg_task:
-        _bg_task.cancel()
+app = FastAPI(title=SERVICE_NAME, lifespan=lifespan)
 
 
 @app.get("/health")
@@ -51,12 +68,13 @@ def health():
         redis_ok = True
     except Exception:
         pass
+
     return {
         "env": settings.env,
         "service": SERVICE_NAME,
         "redis_ok": redis_ok,
-        "execution_mode": settings.execution_mode,
-        "bybit_rest_base_url": settings.bybit_rest_base_url,
+        "db_url_present": bool(settings.database_url),
+        "execution_mode": getattr(settings, "execution_mode", None),
     }
 
 
