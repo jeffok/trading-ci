@@ -2,22 +2,14 @@
 """
 scripts/init_streams.py
 
-用途：
+目的：
 - 初始化 Redis Streams 的 consumer group（幂等）
 - 适用于：首次部署、Redis 重启/清空后恢复、容器启动时自动执行
 
-为什么需要这个脚本：
-- 采用 `python scripts/init_streams.py` 直接运行脚本时，Python 默认把 sys.path[0] 设为 scripts/，
-  可能导致项目根目录（/data/trading-ci）不在模块搜索路径里，从而找不到 libs.common。
-- 本脚本会自动把项目根目录加入 sys.path，确保无论从哪里运行都能 import 项目模块。
-
-建议用法：
-- 方式1（推荐，最稳）：python -m scripts.init_streams  （需 scripts/__init__.py）
-- 方式2：PYTHONPATH="$PWD" python scripts/init_streams.py
-- 方式3：直接 python scripts/init_streams.py（本脚本已兼容）
-
-注意：
-- 脚本只做“确保存在”，不会删除 stream 或清理数据。
+本文件特别处理：
+- 解决 "ModuleNotFoundError: No module named 'libs.common'"：
+  1) 强制把项目根目录插入 sys.path[0]
+  2) 如果发现 sys.modules 中已缓存了“错误来源”的 libs（第三方同名包），主动清掉再导入
 """
 
 from __future__ import annotations
@@ -26,25 +18,67 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 import redis
 
-# ---------------------------------------------------------------------
-# 1) 确保项目根目录在 sys.path 里，避免 `No module named 'libs.common'`
-# ---------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parents[1]  # .../trading-ci
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
-# 现在可以安全 import 项目内部模块
+# ---------------------------------------------------------------------
+# 1) 强制把项目根目录加入 sys.path（放到最前面，优先级最高）
+# ---------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[1]  # /data/trading-ci
+PROJECT_ROOT_STR = str(PROJECT_ROOT)
+
+if PROJECT_ROOT_STR not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT_STR)
+else:
+    # 确保在最前面
+    sys.path.remove(PROJECT_ROOT_STR)
+    sys.path.insert(0, PROJECT_ROOT_STR)
+
+
+# ---------------------------------------------------------------------
+# 2) 防御：清理错误来源的 libs（同名冲突/缓存）
+#    如果 libs 已经被加载，但不是来自项目根目录，则删除缓存让它重新按 sys.path[0] 解析
+# ---------------------------------------------------------------------
+def _purge_conflicting_libs() -> None:
+    mod = sys.modules.get("libs")
+    if not mod:
+        return
+
+    # libs 可能是 namespace package，没有 __file__，用 __path__ 判断
+    mod_file = getattr(mod, "__file__", None)
+    mod_path = getattr(mod, "__path__", None)
+
+    # 判定是否来自项目根目录
+    ok = False
+    if mod_file and PROJECT_ROOT_STR in str(mod_file):
+        ok = True
+    if mod_path:
+        # __path__ 可能是 _NamespacePath，可遍历
+        try:
+            for p in list(mod_path):
+                if PROJECT_ROOT_STR in str(p):
+                    ok = True
+                    break
+        except Exception:
+            pass
+
+    if not ok:
+        # 删除缓存，防止后续 import 继续用错误的 libs
+        del sys.modules["libs"]
+
+
+_purge_conflicting_libs()
+
+
+# ---------------------------------------------------------------------
+# 3) 现在再导入项目内部模块（确保一定命中 /data/trading-ci/libs）
+# ---------------------------------------------------------------------
 from libs.common.config import settings  # noqa: E402
 from libs.mq.redis_streams import RedisStreamsClient  # noqa: E402
 
 
-# ---------------------------------------------------------------------
-# 2) 需要初始化的 Streams 列表（按项目现有约定）
-# ---------------------------------------------------------------------
 DEFAULT_STREAMS: List[str] = [
     "stream:bar_close",
     "stream:signal",
@@ -57,8 +91,8 @@ DEFAULT_STREAMS: List[str] = [
 
 def _get_streams() -> List[str]:
     """
-    允许通过环境变量覆盖/追加 streams：
-    - TRADING_CI_STREAMS="stream:a,stream:b,stream:c"
+    允许通过环境变量覆盖 streams：
+    TRADING_CI_STREAMS="stream:a,stream:b"
     """
     v = os.environ.get("TRADING_CI_STREAMS", "").strip()
     if not v:
@@ -68,10 +102,7 @@ def _get_streams() -> List[str]:
 
 
 def _redis_wait_ready(redis_url: str, *, timeout_sec: int = 60, interval_sec: float = 1.0) -> None:
-    """
-    等待 Redis 就绪：
-    - 容器启动时经常出现 Redis 还没 ready 的竞态，因此这里做等待重试。
-    """
+    """等待 Redis ready（容器启动时常见竞态，必须重试）。"""
     start = time.time()
     last_err = None
     while True:
@@ -86,67 +117,40 @@ def _redis_wait_ready(redis_url: str, *, timeout_sec: int = 60, interval_sec: fl
             time.sleep(interval_sec)
 
 
-def _ensure_groups(redis_url: str, group: str, streams: List[str]) -> Tuple[int, int]:
-    """
-    幂等创建 group：
-    - mkstream=True：没有 stream 时也能创建空 stream
-    - BUSYGROUP：表示 group 已存在，忽略即可
-
-    返回：
-    - created_count：新建 group 数
-    - existed_count：已存在 group 数
-    """
-    client = RedisStreamsClient(redis_url)
-    created = 0
-    existed = 0
-
-    for s in streams:
-        try:
-            # 我们把 xgroup_create 的 id 设为 "0-0"：表示从最早开始。
-            # 对于新系统一般无所谓，因为消费时用 ">" 只读新消息。
-            client.ensure_group(s, group)
-            # ensure_group 内部对 BUSYGROUP 做了吞掉处理；
-            # 这里无法直接区分是否新建，所以再通过 xinfo_groups 判断一次（轻量级）。
-            try:
-                groups = client.r.xinfo_groups(s)
-                if any(g.get("name") == group for g in groups):
-                    # 这里我们不严格区分新建/已存在，只做统计近似：
-                    existed += 1
-                else:
-                    created += 1
-            except Exception:
-                # 如果 Redis 版本不支持 xinfo_groups 或权限限制，就不强求
-                existed += 1
-        except redis.ResponseError as e:
-            # 若 ensure_group 没吞掉 BUSYGROUP（理论上不会），这里兜底处理
-            if "BUSYGROUP" in str(e):
-                existed += 1
-                continue
-            raise
-
-    return created, existed
-
-
 def main() -> None:
+    # 打印 debug，方便你确认到底导入的 libs 来自哪里
+    try:
+        import libs  # noqa
+        libs_file = getattr(libs, "__file__", None)
+        libs_path = getattr(libs, "__path__", None)
+    except Exception as e:  # pragma: no cover
+        libs_file = None
+        libs_path = None
+
+    print("=== trading-ci init_streams ===")
+    print("python:", sys.executable)
+    print("version:", sys.version.replace("\n", " "))
+    print("cwd:", os.getcwd())
+    print("project_root:", PROJECT_ROOT_STR)
+    print("sys.path[0:5]:", sys.path[:5])
+    print("libs.__file__:", libs_file)
+    print("libs.__path__:", list(libs_path) if libs_path else None)
+
     redis_url = settings.redis_url
     group = settings.redis_stream_group
     streams = _get_streams()
 
-    print("=== trading-ci init_streams ===")
-    print("project_root:", str(PROJECT_ROOT))
     print("redis_url:", redis_url)
     print("group:", group)
     print("streams:", streams)
 
-    # 1) 等待 Redis ready
     _redis_wait_ready(redis_url, timeout_sec=int(os.environ.get("REDIS_WAIT_TIMEOUT", "60")))
 
-    # 2) 幂等创建 groups
-    created, existed = _ensure_groups(redis_url, group, streams)
+    client = RedisStreamsClient(redis_url)
+    for s in streams:
+        client.ensure_group(s, group)
 
     print("OK: init_streams done")
-    print("created_groups:", created)
-    print("ensured_groups:", existed)
     print("===============================")
 
 
