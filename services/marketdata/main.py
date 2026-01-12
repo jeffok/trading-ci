@@ -1,19 +1,8 @@
-"""
-marketdata-service 入口（Phase 1）
-
-使用 FastAPI Lifespan 替代 on_event，避免 DeprecationWarning。
-
-启动后后台任务 run_marketdata():
-- Bybit Public WS 订阅 Kline
-- candle 收盘后写库 + 发布 bar_close 事件
-
-保留：/health 供容器编排探测。
-"""
-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -27,34 +16,32 @@ from services.marketdata.worker import run_marketdata
 SERVICE_NAME = "marketdata-service"
 logger = setup_logging(SERVICE_NAME)
 
+_worker_thread: threading.Thread | None = None
+
+
+def _run_worker_in_thread() -> None:
+    try:
+        asyncio.run(run_marketdata())
+    except Exception as e:
+        logger.exception("worker_crashed", extra={"extra_fields": {"event": "WORKER_CRASHED", "error": str(e)}})
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- startup ---
-    logger.info(
-        "startup",
-        extra={"extra_fields": {"event": "SERVICE_START", "env": settings.env}},
-    )
+    global _worker_thread
+    logger.info("startup", extra={"extra_fields": {"event": "SERVICE_START", "env": settings.env}})
 
-    # 轻量依赖探测（不强制失败）
     try:
         RedisStreamsClient(settings.redis_url).r.ping()
     except Exception as e:
-        logger.warning(
-            "redis_ping_failed",
-            extra={"extra_fields": {"event": "REDIS_PING_FAILED", "error": str(e)}},
-        )
+        logger.warning("redis_ping_failed", extra={"extra_fields": {"event": "REDIS_PING_FAILED", "error": str(e)}})
 
-    app.state.bg_task = asyncio.create_task(run_marketdata())
+    _worker_thread = threading.Thread(target=_run_worker_in_thread, name="marketdata-worker", daemon=True)
+    _worker_thread.start()
 
     yield
 
-    # --- shutdown ---
-    task: asyncio.Task | None = getattr(app.state, "bg_task", None)
-    if task:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+    logger.info("shutdown", extra={"extra_fields": {"event": "SERVICE_STOP"}})
 
 
 app = FastAPI(title=SERVICE_NAME, lifespan=lifespan)
@@ -68,7 +55,6 @@ def health():
         redis_ok = True
     except Exception:
         pass
-
     return {
         "env": settings.env,
         "service": SERVICE_NAME,
@@ -78,7 +64,7 @@ def health():
 
 
 def main():
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
 
 
 if __name__ == "__main__":

@@ -1,14 +1,9 @@
 # -*- coding: utf-8 -*-
-"""notifier-service 入口（Phase 4）
-
-使用 FastAPI Lifespan 替代 on_event，避免 DeprecationWarning。
-"""
-
 from __future__ import annotations
 
 import asyncio
-import contextlib
-from contextlib import asynccontextmanager
+import threading
+from contextlib import asyncsuggest_contextmanager, asynccontextmanager
 
 from fastapi import FastAPI
 import uvicorn
@@ -16,37 +11,37 @@ import uvicorn
 from libs.common.config import settings
 from libs.common.logging import setup_logging
 from libs.mq.redis_streams import RedisStreamsClient
-from services.notifier.worker import run_notifier_stream_consumer, run_retry_loop
+from services.notifier.worker import run_notifier
 
 SERVICE_NAME = "notifier-service"
 logger = setup_logging(SERVICE_NAME)
 
+_worker_thread: threading.Thread | None = None
 
-async def run_notifier() -> None:
-    """Run notifier background loops concurrently."""
-    await asyncio.gather(
-        run_notifier_stream_consumer(),
-        run_retry_loop(),
-    )
+
+def _run_worker_in_thread() -> None:
+    try:
+        asyncio.run(run_notifier())
+    except Exception as e:
+        logger.exception("worker_crashed", extra={"extra_fields": {"event": "WORKER_CRASHED", "error": str(e)}})
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- startup ---
-    logger.info(
-        "startup",
-        extra={"extra_fields": {"event": "SERVICE_START", "env": settings.env}},
-    )
-    app.state.bg_task = asyncio.create_task(run_notifier())
+    global _worker_thread
+    logger.info("startup", extra={"extra_fields": {"event": "SERVICE_START", "env": settings.env}})
+
+    try:
+        RedisStreamsClient(settings.redis_url).r.ping()
+    except Exception as e:
+        logger.warning("redis_ping_failed", extra={"extra_fields": {"event": "REDIS_PING_FAILED", "error": str(e)}})
+
+    _worker_thread = threading.Thread(target=_run_worker_in_thread, name="notifier-worker", daemon=True)
+    _worker_thread.start()
 
     yield
 
-    # --- shutdown ---
-    task: asyncio.Task | None = getattr(app.state, "bg_task", None)
-    if task:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+    logger.info("shutdown", extra={"extra_fields": {"event": "SERVICE_STOP"}})
 
 
 app = FastAPI(title=SERVICE_NAME, lifespan=lifespan)
@@ -60,17 +55,16 @@ def health():
         redis_ok = True
     except Exception:
         pass
-
     return {
         "env": settings.env,
         "service": SERVICE_NAME,
         "redis_ok": redis_ok,
-        "telegram_enabled": bool(settings.telegram_bot_token and settings.telegram_chat_id),
+        "telegram_enabled": bool(getattr(settings, "telegram_bot_token", "") and getattr(settings, "telegram_chat_id", "")),
     }
 
 
 def main():
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
 
 
 if __name__ == "__main__":
