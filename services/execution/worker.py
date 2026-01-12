@@ -47,7 +47,7 @@ def _parse(fields: dict, schema: dict) -> dict:
 async def run_trade_plan_consumer() -> None:
     client = RedisStreamsClient(settings.redis_url)
     client.ensure_group("stream:trade_plan", settings.redis_stream_group)
-    consumer = f"{settings.service_name}-tradeplan"
+    consumer = f"{settings.redis_stream_consumer}-tradeplan"
 
     while True:
         msgs = client.read_group("stream:trade_plan", settings.redis_stream_group, consumer, count=20, block_ms=2000)
@@ -95,7 +95,7 @@ async def run_trade_plan_consumer() -> None:
 async def run_bar_close_consumer() -> None:
     client = RedisStreamsClient(settings.redis_url)
     client.ensure_group("stream:bar_close", settings.redis_stream_group)
-    consumer = f"{settings.service_name}-barclose"
+    consumer = f"{settings.redis_stream_consumer}-barclose"
 
     while True:
         msgs = client.read_group("stream:bar_close", settings.redis_stream_group, consumer, count=200, block_ms=2000)

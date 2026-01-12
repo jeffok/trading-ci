@@ -92,18 +92,30 @@ def xinfo_groups_safe(r: redis.Redis, stream: str) -> Any:
 
 
 def xrevrange_latest_event(r: redis.Redis, stream: str, count: int = 20) -> list[dict]:
-    """读取 stream 最新若干条事件（按我们项目约定：field=data 是 JSON string）"""
-    out = []
+    """
+    读取 stream 最新若干条事件。
+    兼容两种字段：
+    - 项目规范：fields["json"] 是 JSON string
+    - 旧格式：fields["data"] 是 JSON string
+    """
+    out: list[dict] = []
     try:
         items = r.xrevrange(stream, max="+", min="-", count=count)
         for msg_id, fields in items:
-            if "data" in fields:
+            raw = None
+            if "json" in fields:
+                raw = fields["json"]
+            elif "data" in fields:
+                raw = fields["data"]
+
+            if raw is not None:
                 try:
-                    evt = json.loads(fields["data"])
+                    evt = json.loads(raw)
                 except Exception:
-                    evt = {"_raw_data": fields["data"]}
+                    evt = {"_raw": raw}
             else:
                 evt = {"_fields": fields}
+
             out.append({"id": msg_id, "event": evt})
     except Exception as e:
         out.append({"error": str(e)})
@@ -115,12 +127,11 @@ def build_trade_plan(env: str) -> Dict[str, Any]:
     plan_id = f"smoke-{uuid.uuid4().hex[:12]}"
     idem = f"idem-{uuid.uuid4().hex}"
 
-    # TradePlan schema（你项目里的 libs/schemas/streams/trade-plan.json）要求 tp_rules 里是固定枚举值
     event = {
         "event_id": f"evt-{uuid.uuid4().hex}",
         "ts_ms": now_ms,
         "env": env,
-        "service": "strategy-service",  # 真实情况下 trade_plan 是 strategy 发出
+        "service": "strategy-service",
         "schema_version": 1,
         "payload": {
             "plan_id": plan_id,
@@ -144,8 +155,14 @@ def build_trade_plan(env: str) -> Dict[str, Any]:
     return event
 
 
-def publish_event(r: redis.Redis, stream: str, event: Dict[str, Any], event_type: Optional[str] = None) -> str:
-    payload: Dict[str, Any] = {"data": json.dumps(event, ensure_ascii=False)}
+def publish_event(
+    r: redis.Redis, stream: str, event: Dict[str, Any], event_type: Optional[str] = None
+) -> str:
+    """
+    ✅ 关键：项目消费者解析优先读取 fields["json"]
+    所以注入必须用字段 json，而不是 data。
+    """
+    payload: Dict[str, Any] = {"json": json.dumps(event, ensure_ascii=False)}
     if event_type:
         payload["type"] = event_type
     return r.xadd(stream, payload)
@@ -160,7 +177,6 @@ def main():
     args = ap.parse_args()
 
     file_env = _load_env_file(args.env_file)
-    # 让 .env 覆盖到当前进程（不覆盖已存在的 env）
     for k, v in file_env.items():
         os.environ.setdefault(k, v)
 
@@ -188,7 +204,12 @@ def main():
         info = xinfo_stream_safe(ctx.r, s)
         groups = xinfo_groups_safe(ctx.r, s)
         print(f"- {s}")
-        print(f"  stream_info: {info if 'error' in info else {'length': info.get('length'), 'last-generated-id': info.get('last-generated-id')}}")
+        if "error" in info:
+            print(f"  stream_info: {info}")
+        else:
+            print(
+                f"  stream_info: {{'length': {info.get('length')}, 'last-generated-id': '{info.get('last-generated-id')}'}}"
+            )
         print(f"  groups: {groups}")
 
     if args.inject_trade_plan:
@@ -202,21 +223,23 @@ def main():
         time.sleep(args.wait_seconds)
 
         print("\n== Check latest outputs ==")
+        plan_id = evt["payload"]["plan_id"]
+
         for out_stream in ["stream:execution_report", "stream:risk_event", "stream:dlq"]:
-            latest = xrevrange_latest_event(ctx.r, out_stream, count=30)
-            # 过滤出跟本次 plan_id 相关的
-            plan_id = evt["payload"]["plan_id"]
+            latest = xrevrange_latest_event(ctx.r, out_stream, count=50)
             related = []
             for item in latest:
                 ev = item.get("event", {})
-                payload = ev.get("payload", {}) if isinstance(ev, dict) else {}
-                if isinstance(payload, dict) and payload.get("plan_id") == plan_id:
-                    related.append(item)
+                if isinstance(ev, dict):
+                    payload = ev.get("payload", {})
+                    if isinstance(payload, dict) and payload.get("plan_id") == plan_id:
+                        related.append(item)
+
             print(f"- {out_stream}: related={len(related)}")
             if related:
                 print(json.dumps(related[:3], ensure_ascii=False, indent=2))
             else:
-                # 没找到就输出最新一条帮助诊断
+                # 没找到就输出最新 1 条帮助诊断
                 print("  (no related event found; latest 1 shown)")
                 print(json.dumps(latest[:1], ensure_ascii=False, indent=2))
 

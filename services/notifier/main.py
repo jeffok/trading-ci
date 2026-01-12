@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from contextlib import asyncsuggest_contextmanager, asynccontextmanager
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 import uvicorn
