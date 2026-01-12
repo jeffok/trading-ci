@@ -102,6 +102,12 @@ def save_position(database_url: str, *, position_id: str, idempotency_key: str, 
             conn.commit()
 
 
+
+
+# Backward-compatible alias: older modules expect `upsert_position`
+upsert_position = save_position
+
+
 def list_open_positions(database_url: str) -> List[Dict[str, Any]]:
     sql = """SELECT position_id, idempotency_key, symbol, timeframe, side, bias, qty_total, qty_runner,
                     entry_price, primary_sl_price, runner_stop_price, status, entry_close_time_ms,
