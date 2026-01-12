@@ -21,9 +21,15 @@
 cp .env.example .env
 ```
 
-### 1.3 初始化 Redis Streams（幂等）
+### 1.3 初始化（已自动化）
+> 从 Stage7 开始，容器启动时会自动执行初始化（幂等）：
+> - Postgres migrations（可用 `SKIP_DB_MIGRATIONS=1` 关闭）
+> - Redis Streams + consumer group（可用 `SKIP_REDIS_STREAMS_INIT=1` 关闭）
+
+如需手动执行（例如本地调试），推荐：
 ```bash
-python scripts/init_streams.py
+python -m scripts.init_streams
+python -m scripts.init_db
 ```
 
 ### 1.4 启动
