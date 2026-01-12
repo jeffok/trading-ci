@@ -18,6 +18,14 @@ logger = setup_logging(SERVICE_NAME)
 app = FastAPI(title=SERVICE_NAME)
 _bg_task: asyncio.Task | None = None
 
+async def run_notifier() -> None:
+    """Run notifier background loops concurrently."""
+    await asyncio.gather(
+        run_notifier_stream_consumer(),
+        run_retry_loop(),
+    )
+
+
 
 @app.on_event("startup")
 async def _startup():
