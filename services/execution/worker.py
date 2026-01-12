@@ -4,16 +4,16 @@
 职责：
 - 消费 stream:trade_plan -> execute_trade_plan（下单/落库/回报）
 - 消费 stream:bar_close -> 生命周期维护（runner trailing / 次日规则） + paper/backtest 撮合模拟
-- 后台：reconcile / 风控监控 / 持仓同步 / 资金快照（Stage 4）
+- 后台：reconcile / 风控监控 / 持仓同步 / 资金快照
 
 原则：
-- 不改变策略规则与交易决策，仅做执行与可观测性/运维闭环。
-- 避免毒消息卡死：异常记录并 ack，同时通过 risk_event / execution_report 事件化。
+- 避免毒消息卡死：异常记录并 ack，同时通过 risk_event 事件化。
 """
 
 from __future__ import annotations
 
 import asyncio
+import traceback
 
 from libs.common.config import settings
 from libs.common.logging import setup_logging
@@ -30,17 +30,17 @@ from services.execution.position_sync import sync_positions
 from services.execution.snapshotter import run_snapshot_loop
 from services.execution.publisher import build_risk_event, publish_risk_event
 
-
 logger = setup_logging("execution-service")
 
 
 def _parse(fields: dict, schema: dict) -> dict:
     """将扁平字段还原为 event dict。"""
-    # libs/mq/events 的 publish_event 会把 event JSON 放进 'json' 字段
     if "json" in fields:
         import json
         return json.loads(fields["json"])
-    # 兼容旧格式
+    if "data" in fields:
+        import json
+        return json.loads(fields["data"])
     return fields
 
 
@@ -58,7 +58,7 @@ async def run_trade_plan_consumer() -> None:
             try:
                 evt = _parse(m.fields, TRADE_PLAN_SCHEMA)
 
-                # 关键路径延迟告警（trade_plan）
+                # 延迟告警
                 if settings.alert_stream_lag_enabled:
                     try:
                         lag = int(now_ms() - int(evt.get("ts_ms", 0)))
@@ -77,13 +77,18 @@ async def run_trade_plan_consumer() -> None:
                 execute_trade_plan(settings.database_url, settings.redis_url, trade_plan_event=evt)
 
             except Exception as e:
-                logger.warning("trade_plan_process_failed", extra={"extra_fields": {"event": "TRADE_PLAN_FAILED", "error": str(e)}})
+                tb = traceback.format_exc()
+                # ✅ 关键：直接打印堆栈，docker logs 必然可见
+                print(tb, flush=True)
+                # ✅ 关键：把 error 拼进 message（你当前日志格式不显示 extra_fields）
+                logger.warning(f"trade_plan_process_failed: {e}", extra={"extra_fields": {"event": "TRADE_PLAN_FAILED", "error": str(e)}})
+
                 try:
                     ev = build_risk_event(
                         typ="TRADE_PLAN_FAILED",
                         severity="IMPORTANT",
                         symbol=None,
-                        detail={"where": "execution-service", "error": str(e)},
+                        detail={"where": "execution-service", "error": str(e), "message_id": m.message_id},
                     )
                     publish_risk_event(settings.redis_url, ev)
                 except Exception:
@@ -106,7 +111,6 @@ async def run_bar_close_consumer() -> None:
             try:
                 evt = _parse(m.fields, BAR_CLOSE_SCHEMA)
 
-                # 关键路径延迟告警（bar_close）
                 if settings.alert_stream_lag_enabled:
                     try:
                         lag = int(now_ms() - int(evt.get("ts_ms", 0)))
@@ -122,21 +126,21 @@ async def run_bar_close_consumer() -> None:
                     except Exception:
                         pass
 
-                # 1) 生命周期规则（runner + 次日规则）
                 on_bar_close(settings.database_url, settings.redis_url, bar_close_event=evt)
 
-                # 2) paper/backtest 撮合模拟（TP/SL/Runner 出场闭环）
                 if str(settings.execution_mode).upper() in ("PAPER", "BACKTEST"):
                     process_paper_bar_close(database_url=settings.database_url, redis_url=settings.redis_url, bar_close_event=evt)
 
             except Exception as e:
-                logger.warning("bar_close_process_failed", extra={"extra_fields": {"event": "BAR_CLOSE_FAILED", "error": str(e)}})
+                tb = traceback.format_exc()
+                print(tb, flush=True)
+                logger.warning(f"bar_close_process_failed: {e}", extra={"extra_fields": {"event": "BAR_CLOSE_FAILED", "error": str(e)}})
                 try:
                     ev = build_risk_event(
                         typ="BAR_CLOSE_FAILED",
                         severity="INFO",
                         symbol=None,
-                        detail={"where": "execution-service", "error": str(e)},
+                        detail={"where": "execution-service", "error": str(e), "message_id": m.message_id},
                     )
                     publish_risk_event(settings.redis_url, ev)
                 except Exception:
@@ -150,7 +154,7 @@ async def run_reconcile_loop() -> None:
         try:
             run_reconcile_once(settings.database_url, settings.redis_url)
         except Exception as e:
-            logger.warning("reconcile_failed", extra={"extra_fields": {"event": "RECONCILE_FAILED", "error": str(e)}})
+            logger.warning(f"reconcile_failed: {e}", extra={"extra_fields": {"event": "RECONCILE_FAILED", "error": str(e)}})
         await asyncio.sleep(5.0)
 
 
@@ -159,7 +163,7 @@ async def run_risk_monitor_loop() -> None:
         try:
             run_risk_monitor_once(settings.database_url, settings.redis_url)
         except Exception as e:
-            logger.warning("risk_monitor_failed", extra={"extra_fields": {"event": "RISK_MONITOR_FAILED", "error": str(e)}})
+            logger.warning(f"risk_monitor_failed: {e}", extra={"extra_fields": {"event": "RISK_MONITOR_FAILED", "error": str(e)}})
         await asyncio.sleep(float(settings.risk_monitor_interval_sec))
 
 
@@ -168,7 +172,7 @@ async def run_position_sync_loop() -> None:
         try:
             sync_positions(settings.database_url, settings.redis_url)
         except Exception as e:
-            logger.warning("position_sync_failed", extra={"extra_fields": {"event": "POSITION_SYNC_FAILED", "error": str(e)}})
+            logger.warning(f"position_sync_failed: {e}", extra={"extra_fields": {"event": "POSITION_SYNC_FAILED", "error": str(e)}})
         await asyncio.sleep(10.0)
 
 
@@ -181,12 +185,3 @@ async def run_execution() -> None:
         run_position_sync_loop(),
         run_snapshot_loop(),
     )
-
-
-def main() -> None:
-    logger.info("starting", extra={"extra_fields": {"event": "START", "mode": settings.execution_mode}})
-    asyncio.run(run_execution())
-
-
-if __name__ == "__main__":
-    main()
