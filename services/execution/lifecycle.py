@@ -28,7 +28,13 @@ from libs.strategy.pivots import pivot_lows, pivot_highs
 from libs.execution.atr import atr_sma
 
 from services.execution.repo import list_open_positions, save_position
-from services.execution.publisher import build_execution_report, publish_execution_report
+from services.execution.publisher import (
+    build_execution_report,
+    publish_execution_report,
+    build_risk_event,
+    publish_risk_event,
+)
+from libs.db.pg import get_conn
 from services.execution.executor import close_position_market
 
 
@@ -36,6 +42,66 @@ def _hist_last(close: List[float]) -> Optional[float]:
     _, _, hist = macd(close)
     return None if hist[-1] is None else float(hist[-1])
 
+
+
+
+
+def _db_get_bars(database_url: str, *, symbol: str, timeframe: str, limit: int = 500) -> List[Dict[str, Any]]:
+    """从 bars 表读取最近 N 根K线（按时间升序返回）。"""
+    sql = """
+    SELECT open, high, low, close, volume, turnover, open_time_ms, close_time_ms
+    FROM bars
+    WHERE symbol=%(symbol)s AND timeframe=%(timeframe)s
+    ORDER BY close_time_ms DESC
+    LIMIT %(limit)s
+    """
+
+    with get_conn(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"symbol": symbol, "timeframe": timeframe, "limit": limit})
+            rows = cur.fetchall()
+
+    # rows is newest->oldest, reverse to chronological order
+    rows = list(reversed(rows))
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append({
+            "open": float(r[0]),
+            "high": float(r[1]),
+            "low": float(r[2]),
+            "close": float(r[3]),
+            "volume": float(r[4]) if r[4] is not None else 0.0,
+            "turnover": float(r[5]) if r[5] is not None else 0.0,
+            "open_time_ms": int(r[6]),
+            "close_time_ms": int(r[7]),
+        })
+    return out
+
+
+def on_bar_close(database_url: str, redis_url: str, *, bar_close_event: Dict[str, Any]) -> None:
+    """execution worker 的生命周期入口（bar_close）。
+
+    目标：保持 worker 调用简单（只传 event），内部完成 bars 拉取与异常告警。
+    """
+    try:
+        update_runner_stop_and_secondary_rule(
+            database_url=database_url,
+            redis_url=redis_url,
+            bar_close_event=bar_close_event,
+            bars_provider=lambda symbol, timeframe, limit=500: _db_get_bars(database_url, symbol=symbol, timeframe=timeframe, limit=limit),
+        )
+    except Exception as e:
+        # 不让生命周期异常阻塞消费；通过 risk_event 告警即可
+        payload = bar_close_event.get("payload", {}) if isinstance(bar_close_event, dict) else {}
+        symbol = payload.get("symbol")
+        detail = {
+            "error": repr(e),
+            "stage": "on_bar_close",
+            "timeframe": payload.get("timeframe"),
+            "close_time_ms": payload.get("close_time_ms"),
+        }
+        ev = build_risk_event(typ="LIFECYCLE_ERROR", severity="CRITICAL", symbol=symbol, detail=detail)
+        publish_risk_event(redis_url, ev)
 
 def update_runner_stop_and_secondary_rule(
     *,
