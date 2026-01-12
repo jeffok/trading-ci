@@ -1,14 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-strategy-service 入口（Phase 2）
-
-使用 FastAPI Lifespan 替代 on_event，避免 DeprecationWarning。
-
-后台任务 `run_strategy()`
-- 消费 stream:bar_close
-- 产出 stream:signal / stream:trade_plan
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -29,7 +19,6 @@ logger = setup_logging(SERVICE_NAME)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- startup ---
     logger.info(
         "startup",
         extra={"extra_fields": {"event": "SERVICE_START", "env": settings.env}},
@@ -44,10 +33,8 @@ async def lifespan(app: FastAPI):
         )
 
     app.state.bg_task = asyncio.create_task(run_strategy())
-
     yield
 
-    # --- shutdown ---
     task: asyncio.Task | None = getattr(app.state, "bg_task", None)
     if task:
         task.cancel()
@@ -76,7 +63,8 @@ def health():
 
 
 def main():
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # ✅ 关键：必须 0.0.0.0 才能被 docker 端口映射访问
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
 
 
 if __name__ == "__main__":
