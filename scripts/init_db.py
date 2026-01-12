@@ -20,6 +20,7 @@ from pathlib import Path
 import hashlib
 import os
 import sys
+import time
 
 import psycopg
 
@@ -52,7 +53,25 @@ def main() -> None:
         print("SKIP: no migration files found")
         return
 
-    with psycopg.connect(settings.database_url) as conn:
+    # 启动时数据库可能尚未就绪（容器编排/网络收敛/外部 DB 短暂重启）。
+    # 这里做连接重试，避免容器在启动阶段反复 crash/restart。
+    last_err: Exception | None = None
+    conn = None
+    for attempt in range(1, 31):  # ~60s 上限（指数退避）
+        try:
+            conn = psycopg.connect(settings.database_url)
+            break
+        except Exception as e:
+            last_err = e
+            # 0.5,1,2,4,8... capped at 5s
+            delay = min(5.0, 0.5 * (2 ** (attempt - 1)))
+            print(f"WARN: db_connect_failed attempt={attempt} delay={delay}s err={e}")
+            time.sleep(delay)
+
+    if conn is None:
+        raise last_err  # type: ignore[misc]
+
+    with conn:
         # 多容器并发启动时，确保只有一个实例在执行迁移
         conn.execute("SELECT pg_advisory_lock(%s)", (MIGRATION_LOCK_ID,))
         try:
