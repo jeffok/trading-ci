@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
-"""notifier-service 入口（Phase 4）"""
+"""notifier-service 入口（Phase 4）
+
+使用 FastAPI Lifespan 替代 on_event，避免 DeprecationWarning。
+"""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 import uvicorn
 
@@ -15,8 +21,6 @@ from services.notifier.worker import run_notifier_stream_consumer, run_retry_loo
 SERVICE_NAME = "notifier-service"
 logger = setup_logging(SERVICE_NAME)
 
-app = FastAPI(title=SERVICE_NAME)
-_bg_task: asyncio.Task | None = None
 
 async def run_notifier() -> None:
     """Run notifier background loops concurrently."""
@@ -26,19 +30,26 @@ async def run_notifier() -> None:
     )
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- startup ---
+    logger.info(
+        "startup",
+        extra={"extra_fields": {"event": "SERVICE_START", "env": settings.env}},
+    )
+    app.state.bg_task = asyncio.create_task(run_notifier())
 
-@app.on_event("startup")
-async def _startup():
-    global _bg_task
-    logger.info("startup", extra={"extra_fields": {"event":"SERVICE_START","env": settings.env}})
-    _bg_task = asyncio.create_task(run_notifier())
+    yield
+
+    # --- shutdown ---
+    task: asyncio.Task | None = getattr(app.state, "bg_task", None)
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
-@app.on_event("shutdown")
-async def _shutdown():
-    global _bg_task
-    if _bg_task:
-        _bg_task.cancel()
+app = FastAPI(title=SERVICE_NAME, lifespan=lifespan)
 
 
 @app.get("/health")
@@ -49,6 +60,7 @@ def health():
         redis_ok = True
     except Exception:
         pass
+
     return {
         "env": settings.env,
         "service": SERVICE_NAME,

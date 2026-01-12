@@ -1,7 +1,9 @@
 """
 marketdata-service 入口（Phase 1）
 
-新增：在 FastAPI 启动后启动后台任务 run_marketdata()。
+使用 FastAPI Lifespan 替代 on_event，避免 DeprecationWarning。
+
+启动后后台任务 run_marketdata():
 - Bybit Public WS 订阅 Kline
 - candle 收盘后写库 + 发布 bar_close 事件
 
@@ -11,43 +13,51 @@ marketdata-service 入口（Phase 1）
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 import uvicorn
 
 from libs.common.config import settings
 from libs.common.logging import setup_logging
 from libs.mq.redis_streams import RedisStreamsClient
-
 from services.marketdata.worker import run_marketdata
 
 SERVICE_NAME = "marketdata-service"
 logger = setup_logging(SERVICE_NAME)
 
-app = FastAPI(title=SERVICE_NAME)
 
-_bg_task: asyncio.Task | None = None
-
-
-@app.on_event("startup")
-async def _startup():
-    global _bg_task
-    logger.info("startup", extra={"extra_fields": {"event": "SERVICE_START", "env": settings.env}})
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- startup ---
+    logger.info(
+        "startup",
+        extra={"extra_fields": {"event": "SERVICE_START", "env": settings.env}},
+    )
 
     # 轻量依赖探测（不强制失败）
     try:
         RedisStreamsClient(settings.redis_url).r.ping()
     except Exception as e:
-        logger.warning("redis_ping_failed", extra={"extra_fields": {"event": "REDIS_PING_FAILED", "error": str(e)}})
+        logger.warning(
+            "redis_ping_failed",
+            extra={"extra_fields": {"event": "REDIS_PING_FAILED", "error": str(e)}},
+        )
 
-    # 启动后台任务：行情闭环
-    _bg_task = asyncio.create_task(run_marketdata())
+    app.state.bg_task = asyncio.create_task(run_marketdata())
+
+    yield
+
+    # --- shutdown ---
+    task: asyncio.Task | None = getattr(app.state, "bg_task", None)
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
-@app.on_event("shutdown")
-async def _shutdown():
-    global _bg_task
-    if _bg_task:
-        _bg_task.cancel()
+app = FastAPI(title=SERVICE_NAME, lifespan=lifespan)
 
 
 @app.get("/health")

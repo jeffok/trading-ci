@@ -2,7 +2,9 @@
 """
 strategy-service 入口（Phase 2）
 
-新增：后台任务 `run_strategy()`
+使用 FastAPI Lifespan 替代 on_event，避免 DeprecationWarning。
+
+后台任务 `run_strategy()`
 - 消费 stream:bar_close
 - 产出 stream:signal / stream:trade_plan
 """
@@ -10,39 +12,50 @@ strategy-service 入口（Phase 2）
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 import uvicorn
 
 from libs.common.config import settings
 from libs.common.logging import setup_logging
 from libs.mq.redis_streams import RedisStreamsClient
-
 from services.strategy.worker import run_strategy
 
 SERVICE_NAME = "strategy-service"
 logger = setup_logging(SERVICE_NAME)
 
-app = FastAPI(title=SERVICE_NAME)
-_bg_task: asyncio.Task | None = None
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- startup ---
+    logger.info(
+        "startup",
+        extra={"extra_fields": {"event": "SERVICE_START", "env": settings.env}},
+    )
 
-@app.on_event("startup")
-async def _startup():
-    global _bg_task
-    logger.info("startup", extra={"extra_fields": {"event":"SERVICE_START","env": settings.env}})
     try:
         RedisStreamsClient(settings.redis_url).r.ping()
     except Exception as e:
-        logger.warning("redis_ping_failed", extra={"extra_fields": {"event":"REDIS_PING_FAILED","error": str(e)}})
+        logger.warning(
+            "redis_ping_failed",
+            extra={"extra_fields": {"event": "REDIS_PING_FAILED", "error": str(e)}},
+        )
 
-    _bg_task = asyncio.create_task(run_strategy())
+    app.state.bg_task = asyncio.create_task(run_strategy())
+
+    yield
+
+    # --- shutdown ---
+    task: asyncio.Task | None = getattr(app.state, "bg_task", None)
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
-@app.on_event("shutdown")
-async def _shutdown():
-    global _bg_task
-    if _bg_task:
-        _bg_task.cancel()
+app = FastAPI(title=SERVICE_NAME, lifespan=lifespan)
 
 
 @app.get("/health")
