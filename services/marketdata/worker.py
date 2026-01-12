@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 marketdata-service 主工作流（Phase 1）
 
@@ -22,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from libs.common.config import settings
 from libs.common.logging import setup_logging
 from libs.mq.redis_streams import RedisStreamsClient
+from libs.mq.dlq import publish_dlq
 from libs.bybit.intervals import bybit_interval_for_system_timeframe
 from libs.bybit.market_rest import BybitMarketRestClient
 from libs.bybit.ws_public import BybitPublicWsClient
@@ -29,6 +31,9 @@ from libs.bybit.ws_public import BybitPublicWsClient
 from services.marketdata.config import MarketdataSettings
 from services.marketdata.repo_bars import upsert_bar
 from services.marketdata.publisher import build_bar_close_event, publish_bar_close
+from services.marketdata.gapfill import handle_confirmed_candle
+from services.marketdata.publisher_risk import build_risk_event, publish_risk_event
+from services.marketdata.repo_risk import insert_risk_event
 from services.marketdata.derived_8h import Derived8hAggregator
 
 

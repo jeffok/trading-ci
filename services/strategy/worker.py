@@ -33,11 +33,14 @@ from typing import Any, Dict, List, Optional
 
 from libs.common.config import settings
 from libs.common.logging import setup_logging
+from libs.common.time import now_ms
 from libs.mq.redis_streams import RedisStreamsClient
+from libs.mq.dlq import publish_dlq
 from libs.mq.schema_validator import validate
 
 from libs.strategy.divergence import detect_three_segment_divergence
 from libs.strategy.confluence import Candle, vegas_state, engulfing, rsi_divergence, obv_divergence, fvg_proximity
+from libs.strategy.scoring import DivergenceFeatures, divergence_strength as div_strength_score, confluence_strength, signal_quality_score
 
 from services.strategy.repo import get_bars, save_signal, save_trade_plan
 from services.strategy.publisher import (
@@ -106,6 +109,20 @@ async def process_bar_close(event: Dict[str, Any]) -> None:
 
     bias = setup.direction  # LONG/SHORT
 
+    # -------- Phase 5：信号评分（仅用于复盘，不参与决策）--------
+    # divergence_strength：0~60
+    feat = DivergenceFeatures(
+        hist2=float(setup.h2),
+        hist3=float(setup.h3),
+        price2=float(setup.p2.price),
+        price3=float(setup.p3.price),
+        i1=int(setup.p1.index),
+        i2=int(setup.p2.index),
+        i3=int(setup.p3.index),
+    )
+    div_score = div_strength_score(feat)  # 0~60
+
+
     # 2) Vegas 强门槛（同向必须）
     vs = vegas_state(close)
     if bias == "LONG" and vs != "Bullish":
@@ -127,10 +144,80 @@ async def process_bar_close(event: Dict[str, Any]) -> None:
     if len(hits) < settings.min_confirmations:
         return
 
+    # -------- Phase 5：共振评分 + 总分（仅用于复盘，不参与决策）--------
+    conf_score = confluence_strength(hit_count=len(hits), min_confirmations=settings.min_confirmations)  # 0~40
+    quality_score = signal_quality_score(divergence_score=div_score, confluence_score=conf_score)  # 0~100
+    signal_score_int = int(round(quality_score))
+    divergence_strength_int = int(round(div_score))
+    confluence_strength_int = int(round(conf_score))
+
+    scoring_ext = {
+        "signal_quality_score": signal_score_int,
+        "divergence_strength": divergence_strength_int,
+        "confluence_strength": confluence_strength_int,
+        "confirmations_hit": hits,
+    }
+
+
     # 4) 输出 signal（并落库）
     idem = _idempotency_key(symbol, timeframe, close_time_ms, bias)
     setup_id = _setup_id(symbol, timeframe, close_time_ms, bias)
     trigger_id = _trigger_id(symbol, timeframe, close_time_ms, bias)
+
+    # ---------------- Stage 3：setup/trigger/pivot 落库（不影响决策） ----------------
+    # 1) setup：三段背离结构
+    try:
+        upsert_setup(
+            settings.database_url,
+            setup_id=setup_id,
+            idempotency_key=idem,  # setup 与 signal 同幂等键
+            symbol=symbol,
+            timeframe=timeframe,
+            close_time_ms=close_time_ms,
+            bias=bias,
+            setup_type="MACD_3SEG_DIVERGENCE",
+            payload={
+                "p1": {"i": int(setup.p1), "price": float(setup.price1), "hist": float(setup.h1)},
+                "p2": {"i": int(setup.p2), "price": float(setup.price2), "hist": float(setup.h2)},
+                "p3": {"i": int(setup.p3), "price": float(setup.price3), "hist": float(setup.h3)},
+            },
+        )
+
+        # 2) pivots：至少把三段对应的 pivot 落库（pivot_time_ms 用 bars 的 close_time_ms 近似）
+        # 注意：p1/p2/p3 是序列索引，这里用 candles 索引映射到 close_time_ms。
+        # 如果后续需要更精确，可把 pivot_time_ms 绑定到 open_time_ms/close_time_ms 对应的 bar。
+        p1_ct = int(bars[int(setup.p1)]["close_time_ms"])
+        p2_ct = int(bars[int(setup.p2)]["close_time_ms"])
+        p3_ct = int(bars[int(setup.p3)]["close_time_ms"])
+
+        # LONG：低点；SHORT：高点（此处仅用于 pivot_type 复盘标注）
+        ptype = "LOW" if bias == "LONG" else "HIGH"
+
+        upsert_pivot(settings.database_url, pivot_id=f"{setup_id}:1", setup_id=setup_id, symbol=symbol, timeframe=timeframe,
+                     pivot_time_ms=p1_ct, pivot_price=float(setup.price1), pivot_type=ptype, segment_no=1, meta={"hist": float(setup.h1), "i": int(setup.p1)})
+        upsert_pivot(settings.database_url, pivot_id=f"{setup_id}:2", setup_id=setup_id, symbol=symbol, timeframe=timeframe,
+                     pivot_time_ms=p2_ct, pivot_price=float(setup.price2), pivot_type=ptype, segment_no=2, meta={"hist": float(setup.h2), "i": int(setup.p2)})
+        upsert_pivot(settings.database_url, pivot_id=f"{setup_id}:3", setup_id=setup_id, symbol=symbol, timeframe=timeframe,
+                     pivot_time_ms=p3_ct, pivot_price=float(setup.price3), pivot_type=ptype, segment_no=3, meta={"hist": float(setup.h3), "i": int(setup.p3)})
+    except Exception:
+        pass
+
+    # 3) trigger：共振确认命中项（hits）
+    try:
+        upsert_trigger(
+            settings.database_url,
+            trigger_id=trigger_id,
+            idempotency_key=idem,  # trigger 与 signal 同幂等键，保证重放不重复
+            setup_id=setup_id,
+            symbol=symbol,
+            timeframe=timeframe,
+            close_time_ms=close_time_ms,
+            bias=bias,
+            hits=hits,
+            payload={"hits": hits, "min_confirmations": int(settings.min_confirmations)},
+        )
+    except Exception:
+        pass
 
     signal_event = build_signal_event(
         symbol=symbol,
@@ -141,6 +228,9 @@ async def process_bar_close(event: Dict[str, Any]) -> None:
         hits=hits,
         setup_id=setup_id,
         trigger_id=trigger_id,
+        signal_score=signal_score_int,
+        divergence_strength=divergence_strength_int,
+        ext={"scoring": scoring_ext},
     )
     publish_signal(settings.redis_url, signal_event)
 
@@ -156,7 +246,7 @@ async def process_bar_close(event: Dict[str, Any]) -> None:
         vegas_state=vs,
         hit_count=len(hits),
         hits=hits,
-        signal_score=None,
+        signal_score=signal_score_int,
         payload=signal_event,
     )
 
@@ -181,6 +271,7 @@ async def process_bar_close(event: Dict[str, Any]) -> None:
             primary_sl_price=primary_sl,
             setup_id=setup_id,
             trigger_id=trigger_id,
+            ext={"close_time_ms": close_time_ms, "scoring": scoring_ext, "run_id": run_id} if run_id else {"close_time_ms": close_time_ms, "scoring": scoring_ext},
         )
         publish_trade_plan(settings.redis_url, plan_event)
 

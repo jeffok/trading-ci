@@ -40,6 +40,7 @@ def build_signal_event(
     signal_score: Optional[int] = None,
     divergence_strength: Optional[int] = None,
     market_state: str = "NORMAL",
+    ext: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     event = {
         "event_id": new_event_id(),
@@ -71,7 +72,7 @@ def build_signal_event(
             "signal_score": signal_score,
             "divergence_strength": divergence_strength,
             "market_state": market_state,
-            "ext": {},
+            "ext": (ext or {}),
         },
         "ext": {},
     }
@@ -98,6 +99,7 @@ def build_trade_plan_event(
     trigger_id: str,
     trace_id: Optional[str] = None,
     risk_pct: Optional[float] = None,
+    ext: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     event = {
         "event_id": new_event_id(),
@@ -133,7 +135,7 @@ def build_trade_plan_event(
                 "signal_score": None,
             },
             "traceability": {"setup_id": setup_id, "trigger_id": trigger_id},
-            "ext": {"close_time_ms": close_time_ms},
+            "ext": (ext or {"close_time_ms": close_time_ms}),
         },
         "ext": {},
     }

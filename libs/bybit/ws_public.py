@@ -1,15 +1,14 @@
-"""
-Bybit V5 Public WebSocket（线性合约）——最小实现：订阅 Kline
+# -*- coding: utf-8 -*-
+"""Bybit V5 Public WebSocket（线性合约）——最小实现：订阅 Kline
 
-官方要点：
-- 连接地址（linear）：wss://stream.bybit.com/v5/public/linear
-- 订阅格式：{"op":"subscribe","args":["kline.{interval}.{symbol}"]}
-- Kline push：data[].confirm=true 表示 candle 收盘（可用于 bar_close 事件触发）
-- 心跳：建议每 20s 发送 {"op":"ping"} 维持连接
-
-本模块目标（Phase 1）：
-- 管理连接/重连/心跳
+Stage 2 以后我们需要：
+- 断线自动重连（指数退避）
+- 连接成功事件（用于 WS_RECONNECT 可观测性）
 - 将收到的 JSON message 回调给上层（marketdata-service）
+
+注意：
+- 本模块只做“连接与消息转发”，不解析业务含义；
+- 市场数据“缺口检测/回填”由 marketdata.gapfill 负责。
 """
 
 from __future__ import annotations
@@ -18,12 +17,16 @@ import asyncio
 import json
 import random
 from dataclasses import dataclass
-from typing import Awaitable, Callable, List
+from typing import Any, Awaitable, Callable, List, Optional
 
 import websockets
 
+from libs.logging import setup_logging
+
+logger = setup_logging("bybit-public-ws")
 
 MessageHandler = Callable[[dict], Awaitable[None]]
+OnConnectedHandler = Callable[[int], Any]
 
 
 @dataclass
@@ -31,42 +34,68 @@ class BybitPublicWsClient:
     ws_url: str
     topics: List[str]
     on_message: MessageHandler
+    on_connected: Optional[OnConnectedHandler] = None
     ping_interval_s: int = 20
 
     async def run_forever(self) -> None:
-        """
-        永久在线：断线自动重连（指数退避 + 抖动）。
-        """
-        backoff_s = 1
+        """永久运行：断线自动重连。"""
+        backoff_s = 1.0
+        connect_count = 0
+
         while True:
+            connect_count += 1
             try:
-                await self._run_once()
-                backoff_s = 1  # 正常退出后重置（通常不会发生）
-            except Exception:
-                sleep_s = min(60, backoff_s) + random.random()
-                await asyncio.sleep(sleep_s)
-                backoff_s *= 2
+                await self._run_once(connect_count=connect_count)
+                # 如果正常退出（很少见），立即重连
+                backoff_s = 1.0
+            except Exception as e:
+                logger.warning("ws_run_once_failed", extra={"extra_fields": {"err": str(e), "backoff_s": backoff_s}})
+                # 指数退避 + 抖动
+                jitter = random.random() * 0.3
+                await asyncio.sleep(backoff_s + jitter)
+                backoff_s = min(60.0, backoff_s * 2.0)
 
-    async def _run_once(self) -> None:
-        """连接一次，直到异常或被关闭。"""
+    async def _run_once(self, *, connect_count: int) -> None:
+        """建立一次连接并持续接收消息，直到异常断开。"""
         async with websockets.connect(self.ws_url, ping_interval=None) as ws:
-            # 订阅主题
-            await ws.send(json.dumps({"op": "subscribe", "args": self.topics}))
+            logger.info("ws_connected", extra={"extra_fields": {"ws_url": self.ws_url, "connect_count": connect_count}})
 
-            # 启动心跳任务：建议每 20s 发送 ping 保持连接
-            ping_task = asyncio.create_task(self._heartbeat(ws))
+            # 连接成功回调（用于 WS_RECONNECT 事件）
+            if self.on_connected is not None:
+                try:
+                    r = self.on_connected(int(connect_count))
+                    if asyncio.iscoroutine(r):
+                        await r
+                except Exception:
+                    # 连接回调不应影响 WS 主流程
+                    pass
+
+            # 订阅主题
+            for t in self.topics:
+                await ws.send(json.dumps({"op": "subscribe", "args": [t]}))
+
+            # 心跳任务
+            ping_task = asyncio.create_task(self._ping_loop(ws))
 
             try:
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    await self.on_message(msg)
+                while True:
+                    raw = await ws.recv()
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        continue
+                    await self.on_message(obj)
             finally:
                 ping_task.cancel()
+                try:
+                    await ping_task
+                except Exception:
+                    pass
 
-    async def _heartbeat(self, ws) -> None:
-        """定时发送 ping，维持连接。"""
+    async def _ping_loop(self, ws) -> None:
+        """按固定间隔发送 ping，保持连接活跃。"""
         while True:
-            await asyncio.sleep(self.ping_interval_s)
+            await asyncio.sleep(float(self.ping_interval_s))
             try:
                 await ws.send(json.dumps({"op": "ping"}))
             except Exception:

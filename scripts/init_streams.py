@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Redis Streams 初始化脚本（幂等）"""
@@ -6,6 +7,7 @@ from libs.common.config import settings
 from libs.mq.redis_streams import RedisStreamsClient
 
 STREAMS = [
+    "stream:dlq",
   "stream:bar_close",
   "stream:signal",
   "stream:trade_plan",

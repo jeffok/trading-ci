@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """marketdata-service 配置（Phase 1）
 
 - MARKETDATA_SYMBOLS：订阅的交易对列表
@@ -19,6 +20,9 @@ def _csv(name: str, default: str) -> List[str]:
 
 @dataclass
 class MarketdataSettings:
+    gapfill_enabled: bool
+    gapfill_max_bars: int
+
     symbols: List[str]
     timeframes: List[str]
     enable_rest_backfill: bool
@@ -31,4 +35,6 @@ class MarketdataSettings:
             timeframes=_csv("MARKETDATA_TIMEFRAMES", "15m,30m,1h,4h,8h,1d"),
             enable_rest_backfill=os.getenv("MARKETDATA_ENABLE_REST_BACKFILL", "true").lower() == "true",
             backfill_limit=int(os.getenv("MARKETDATA_BACKFILL_LIMIT", "500")),
+            gapfill_enabled=os.getenv("MARKETDATA_GAPFILL_ENABLED", "true").lower() == "true",
+            gapfill_max_bars=int(os.getenv("MARKETDATA_GAPFILL_MAX_BARS", "2000")),
         )
