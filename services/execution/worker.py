@@ -137,7 +137,9 @@ async def run_bar_close_consumer() -> None:
             except Exception as e:
                 tb = traceback.format_exc()
                 print(tb, flush=True)
-                logger.warning(f"bar_close_process_failed: {e}", extra={"extra_fields": {"event": "BAR_CLOSE_FAILED", "error": str(e)}})
+                # 防止错误消息中包含未转义的格式化字符串
+                error_str = str(e).replace("{", "{{").replace("}", "}}")
+                logger.warning(f"bar_close_process_failed: {error_str}", extra={"extra_fields": {"event": "BAR_CLOSE_FAILED", "error": str(e)}})
                 try:
                     ev = build_risk_event(
                         typ="BAR_CLOSE_FAILED",
@@ -157,7 +159,9 @@ async def run_reconcile_loop() -> None:
         try:
             run_reconcile_once(settings.database_url, settings.redis_url)
         except Exception as e:
-            logger.warning(f"reconcile_failed: {e}", extra={"extra_fields": {"event": "RECONCILE_FAILED", "error": str(e)}})
+            # 防止错误消息中包含未转义的格式化字符串
+            error_str = str(e).replace("{", "{{").replace("}", "}}")
+            logger.warning(f"reconcile_failed: {error_str}", extra={"extra_fields": {"event": "RECONCILE_FAILED", "error": str(e)}})
         await asyncio.sleep(5.0)
 
 
@@ -166,7 +170,9 @@ async def run_risk_monitor_loop() -> None:
         try:
             run_risk_monitor_once(settings.database_url, settings.redis_url)
         except Exception as e:
-            logger.warning(f"risk_monitor_failed: {e}", extra={"extra_fields": {"event": "RISK_MONITOR_FAILED", "error": str(e)}})
+            # 防止错误消息中包含未转义的格式化字符串
+            error_str = str(e).replace("{", "{{").replace("}", "}}")
+            logger.warning(f"risk_monitor_failed: {error_str}", extra={"extra_fields": {"event": "RISK_MONITOR_FAILED", "error": str(e)}})
         await asyncio.sleep(float(settings.risk_monitor_interval_sec))
 
 
@@ -175,7 +181,9 @@ async def run_position_sync_loop() -> None:
         try:
             sync_positions(settings.database_url, settings.redis_url)
         except Exception as e:
-            logger.warning(f"position_sync_failed: {e}", extra={"extra_fields": {"event": "POSITION_SYNC_FAILED", "error": str(e)}})
+            # 防止错误消息中包含未转义的格式化字符串
+            error_str = str(e).replace("{", "{{").replace("}", "}}")
+            logger.warning(f"position_sync_failed: {error_str}", extra={"extra_fields": {"event": "POSITION_SYNC_FAILED", "error": str(e)}})
         await asyncio.sleep(10.0)
 
 

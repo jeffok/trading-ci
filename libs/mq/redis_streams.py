@@ -44,7 +44,9 @@ class RedisStreamsClient:
         block_ms: int = 2000,
     ) -> List[StreamMessage]:
         """从 consumer group 读取消息（只读新消息：">"）。"""
-        resp = self.r.xreadgroup(group, consumer, {stream: ">"}, count=count, block=block_ms)
+        # redis-py 5.0+ 使用命名参数
+        # xreadgroup(groupname, consumername, streams, count=None, block=None)
+        resp = self.r.xreadgroup(groupname=group, consumername=consumer, streams={stream: ">"}, count=count, block=block_ms)
         out: List[StreamMessage] = []
         for (s, msgs) in resp:
             for (mid, fields) in msgs:
