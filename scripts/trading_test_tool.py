@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # 添加项目根目录到路径
 project_root = Path(__file__).parent.parent
