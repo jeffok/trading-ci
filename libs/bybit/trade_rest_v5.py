@@ -345,10 +345,12 @@ class TradeRestV5Client:
     def place_order(self, *, category: str, symbol: str, side: str, order_type: str, qty: str,
                     price: Optional[str] = None, time_in_force: str = "GTC", reduce_only: bool = False,
                     position_idx: int = 0, order_link_id: Optional[str] = None) -> Dict[str, Any]:
+        # Bybit API 要求 side 为 "Buy" 或 "Sell"（首字母大写），内部使用 "BUY"/"SELL"
+        bybit_side = "Buy" if side.upper() == "BUY" else "Sell"
         body: Dict[str, Any] = {
             "category": category,
             "symbol": symbol,
-            "side": side,
+            "side": bybit_side,
             "orderType": order_type,
             "qty": qty,
             "timeInForce": time_in_force,

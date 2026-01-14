@@ -23,6 +23,7 @@ try:
     from libs.common.config import settings
     from libs.common.time import now_ms
     from libs.db.pg import get_conn
+    from libs.bybit.market_rest import BybitMarketRestClient
 except ImportError as e:
     print(f"❌ 导入错误: {e}")
     print("\n💡 提示：在 Docker 容器中运行：")
@@ -437,6 +438,47 @@ def cmd_clean(args):
             else:
                 print_warning(f"仍有 {remaining} 个 OPEN 持仓")
 
+# ==================== 获取市场价格功能 ====================
+
+def get_current_market_price(symbol: str) -> Optional[float]:
+    """获取当前市场价格（使用最新 K 线收盘价）"""
+    try:
+        client = BybitMarketRestClient(base_url=settings.bybit_rest_base_url)
+        klines = client.get_kline(
+            symbol=symbol.upper(),
+            interval="1",  # 1 分钟 K 线
+            category=settings.bybit_category,
+            limit=1,
+        )
+        if klines and len(klines) > 0:
+            return float(klines[0]["close"])
+        return None
+    except Exception as e:
+        print_error(f"获取市场价格失败: {e}")
+        return None
+
+def calculate_entry_and_sl_prices(
+    symbol: str,
+    side: str,
+    current_price: float,
+    sl_distance_pct: float = 0.02,  # 默认止损距离 2%
+) -> Tuple[float, float]:
+    """根据当前价格和方向计算入场价和止损价"""
+    side_upper = side.upper()
+    
+    if side_upper == "BUY":
+        # BUY: 入场价使用当前价格，止损价在当前价格下方
+        entry_price = current_price
+        sl_price = current_price * (1 - sl_distance_pct)
+    elif side_upper == "SELL":
+        # SELL: 入场价使用当前价格，止损价在当前价格上方
+        entry_price = current_price
+        sl_price = current_price * (1 + sl_distance_pct)
+    else:
+        raise ValueError(f"无效的 side: {side}")
+    
+    return entry_price, sl_price
+
 # ==================== 执行测试下单功能 ====================
 
 def build_trade_plan(
@@ -617,12 +659,39 @@ def cmd_test(args):
     print(f"  风险百分比: {settings.risk_pct} ({settings.risk_pct * 100}%)")
     print(f"  最大持仓数: {settings.max_open_positions}")
     print(f"  账户熔断: {'启用' if settings.account_kill_switch_enabled else '未启用'}")
+    
+    # 自动获取或使用指定的价格
+    entry_price = args.entry_price
+    sl_price = args.sl_price
+    
+    if entry_price is None or sl_price is None:
+        print_info(f"\n正在获取 {args.symbol} 的当前市场价格...")
+        current_price = get_current_market_price(args.symbol)
+        
+        if current_price is None:
+            print_error("无法获取市场价格，请手动指定 --entry-price 和 --sl-price")
+            sys.exit(1)
+        
+        print_success(f"当前市场价格: {current_price}")
+        
+        # 计算入场价和止损价
+        entry_price, sl_price = calculate_entry_and_sl_prices(
+            symbol=args.symbol,
+            side=args.side,
+            current_price=current_price,
+            sl_distance_pct=args.sl_distance_pct,
+        )
+        
+        print_info(f"自动计算的价格：")
+        print(f"  入场价格: {entry_price:.2f}")
+        print(f"  止损价格: {sl_price:.2f} (距离: {args.sl_distance_pct * 100:.1f}%)")
+    
     print(f"\n交易参数：")
     print(f"  交易对: {args.symbol}")
     print(f"  方向: {args.side}")
     print(f"  时间框架: {args.timeframe}")
-    print(f"  入场价格: {args.entry_price}")
-    print(f"  止损价格: {args.sl_price}")
+    print(f"  入场价格: {entry_price}")
+    print(f"  止损价格: {sl_price}")
     
     # 确认
     if not args.confirm:
@@ -646,8 +715,8 @@ def cmd_test(args):
         symbol=args.symbol.upper(),
         timeframe=args.timeframe,
         side=args.side.upper(),
-        entry_price=args.entry_price,
-        sl_price=args.sl_price,
+        entry_price=entry_price,
+        sl_price=sl_price,
         env=settings.env,
     )
     
@@ -760,12 +829,23 @@ def main():
   python -m scripts.trading_test_tool clean --all --yes
   python -m scripts.trading_test_tool clean <position_id>
 
-  # 执行测试下单
+  # 执行测试下单（自动获取价格）
+  python -m scripts.trading_test_tool test \\
+    --symbol BTCUSDT \\
+    --side BUY
+
+  # 执行测试下单（手动指定价格）
   python -m scripts.trading_test_tool test \\
     --symbol BTCUSDT \\
     --side BUY \\
     --entry-price 30000 \\
     --sl-price 29000
+
+  # 执行测试下单（自定义止损距离）
+  python -m scripts.trading_test_tool test \\
+    --symbol BTCUSDT \\
+    --side BUY \\
+    --sl-distance-pct 0.03
 
   # 查看订单
   python -m scripts.trading_test_tool orders
@@ -792,8 +872,9 @@ def main():
     test_parser = subparsers.add_parser('test', help='执行测试下单（⚠️ 会真实下单！）')
     test_parser.add_argument('--symbol', required=True, help='交易对，如 BTCUSDT')
     test_parser.add_argument('--side', required=True, choices=['BUY', 'SELL'], help='方向：BUY 或 SELL')
-    test_parser.add_argument('--entry-price', type=float, required=True, help='入场价格')
-    test_parser.add_argument('--sl-price', type=float, required=True, help='止损价格')
+    test_parser.add_argument('--entry-price', type=float, default=None, help='入场价格（可选，不指定则自动获取市场价格）')
+    test_parser.add_argument('--sl-price', type=float, default=None, help='止损价格（可选，不指定则自动计算）')
+    test_parser.add_argument('--sl-distance-pct', type=float, default=0.02, help='止损距离百分比（默认: 0.02，即 2%%）')
     test_parser.add_argument('--timeframe', default='15m', help='时间框架（默认: 15m）')
     test_parser.add_argument('--wait-seconds', type=int, default=30, help='等待执行的时间（秒，默认: 30）')
     test_parser.add_argument('--confirm', action='store_true', help='跳过确认提示（谨慎使用）')
