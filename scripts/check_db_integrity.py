@@ -113,9 +113,9 @@ def main():
         "execution_reports",
         "risk_events",
         "risk_state",
-        "three_segment_setups",
-        "entry_triggers",
-        "pivot_points",
+        "setups",  # 注意：实际表名是 setups，不是 three_segment_setups
+        "triggers",  # 注意：实际表名是 triggers，不是 entry_triggers
+        "pivots",  # 注意：实际表名是 pivots，不是 pivot_points
         "indicator_snapshots",
         "notifications",
         "execution_traces",
