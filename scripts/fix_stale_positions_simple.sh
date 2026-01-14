@@ -98,15 +98,21 @@ echo "  修复数据库中的无效持仓"
 echo "=========================================="
 echo ""
 
-# 检查 psql 是否可用
+# 检查 psql 是否可用，以及是否支持 SCRAM 认证
+USE_DOCKER=false
 if ! command -v psql > /dev/null 2>&1; then
-    print_error "未找到 psql 命令"
-    echo ""
-    echo "💡 提示："
-    echo "   1. 安装 PostgreSQL 客户端"
-    echo "   2. 或在 Docker 容器中运行："
-    echo "      docker compose exec execution bash scripts/fix_stale_positions_simple.sh --dry-run"
-    exit 1
+    print_warning "未找到 psql 命令，将使用 Docker 容器"
+    USE_DOCKER=true
+else
+    # 测试 psql 版本是否支持 SCRAM（尝试连接，如果失败则使用 Docker）
+    if ! psql "$DB_URL" -c "SELECT 1;" > /dev/null 2>&1; then
+        ERROR_MSG=$(psql "$DB_URL" -c "SELECT 1;" 2>&1)
+        if echo "$ERROR_MSG" | grep -q "SCRAM authentication requires libpq version 10"; then
+            print_warning "本地 psql 版本过旧，不支持 SCRAM 认证"
+            print_info "将使用 Docker 容器执行数据库操作"
+            USE_DOCKER=true
+        fi
+    fi
 fi
 
 print_info "数据库连接: ${DB_URL%%@*}@***"
@@ -114,7 +120,11 @@ echo ""
 
 # 查询 OPEN 持仓
 print_info "查询数据库中的 OPEN 持仓..."
-OPEN_COUNT=$(psql "${DB_URL}" -t -c "SELECT COUNT(*) FROM positions WHERE status='OPEN';" 2>/dev/null | tr -d ' ' || echo "0")
+if [ "$USE_DOCKER" = true ]; then
+    OPEN_COUNT=$(docker compose exec -T execution psql "$DB_URL" -t -c "SELECT COUNT(*) FROM positions WHERE status='OPEN';" 2>/dev/null | tr -d ' ' || echo "0")
+else
+    OPEN_COUNT=$(psql "${DB_URL}" -t -c "SELECT COUNT(*) FROM positions WHERE status='OPEN';" 2>/dev/null | tr -d ' ' || echo "0")
+fi
 
 if [ "$OPEN_COUNT" = "0" ] || [ -z "$OPEN_COUNT" ]; then
     print_success "数据库中没有 OPEN 状态的持仓"
@@ -126,7 +136,8 @@ echo ""
 
 # 显示持仓列表
 print_info "持仓列表:"
-psql "${DB_URL}" -c "
+if [ "$USE_DOCKER" = true ]; then
+    docker compose exec -T execution psql "$DB_URL" -c "
 SELECT 
     position_id,
     symbol,
@@ -143,6 +154,25 @@ ORDER BY created_at DESC;
     print_error "查询失败，请检查数据库连接"
     exit 1
 }
+else
+    psql "${DB_URL}" -c "
+SELECT 
+    position_id,
+    symbol,
+    timeframe,
+    side,
+    qty_total,
+    entry_price,
+    idempotency_key,
+    created_at
+FROM positions
+WHERE status = 'OPEN'
+ORDER BY created_at DESC;
+" 2>/dev/null || {
+    print_error "查询失败，请检查数据库连接"
+    exit 1
+}
+fi
 
 echo ""
 
@@ -179,20 +209,37 @@ if [ "$FORCE" = true ]; then
     fi
     
     print_info "开始清理所有 OPEN 持仓..."
-    psql "${DB_URL}" -c "
-    UPDATE positions
-    SET 
-        status = 'CLOSED',
-        updated_at = now(),
-        closed_at_ms = extract(epoch from now())::bigint * 1000,
-        exit_reason = 'MANUAL_CLEANUP'
-    WHERE status = 'OPEN';
-    " 2>/dev/null && {
-        print_success "完成！已清理所有 OPEN 持仓"
-    } || {
-        print_error "清理失败"
-        exit 1
-    }
+    if [ "$USE_DOCKER" = true ]; then
+        docker compose exec -T execution psql "$DB_URL" -c "
+        UPDATE positions
+        SET 
+            status = 'CLOSED',
+            updated_at = now(),
+            closed_at_ms = extract(epoch from now())::bigint * 1000,
+            exit_reason = 'MANUAL_CLEANUP'
+        WHERE status = 'OPEN';
+        " 2>/dev/null && {
+            print_success "完成！已清理所有 OPEN 持仓"
+        } || {
+            print_error "清理失败"
+            exit 1
+        }
+    else
+        psql "${DB_URL}" -c "
+        UPDATE positions
+        SET 
+            status = 'CLOSED',
+            updated_at = now(),
+            closed_at_ms = extract(epoch from now())::bigint * 1000,
+            exit_reason = 'MANUAL_CLEANUP'
+        WHERE status = 'OPEN';
+        " 2>/dev/null && {
+            print_success "完成！已清理所有 OPEN 持仓"
+        } || {
+            print_error "清理失败"
+            exit 1
+        }
+    fi
     
 elif [ -n "$SYMBOL" ]; then
     print_warning "⚠️  将清理 $SYMBOL 的所有 OPEN 持仓"
@@ -203,26 +250,47 @@ elif [ -n "$SYMBOL" ]; then
     fi
     
     print_info "开始清理 $SYMBOL 的 OPEN 持仓..."
-    psql "${DB_URL}" -c "
-    UPDATE positions
-    SET 
-        status = 'CLOSED',
-        updated_at = now(),
-        closed_at_ms = extract(epoch from now())::bigint * 1000,
-        exit_reason = 'MANUAL_CLEANUP'
-    WHERE status = 'OPEN' AND symbol = '$SYMBOL';
-    " 2>/dev/null && {
-        print_success "完成！已清理 $SYMBOL 的 OPEN 持仓"
-    } || {
-        print_error "清理失败"
-        exit 1
-    }
+    if [ "$USE_DOCKER" = true ]; then
+        docker compose exec -T execution psql "$DB_URL" -c "
+        UPDATE positions
+        SET 
+            status = 'CLOSED',
+            updated_at = now(),
+            closed_at_ms = extract(epoch from now())::bigint * 1000,
+            exit_reason = 'MANUAL_CLEANUP'
+        WHERE status = 'OPEN' AND symbol = '$SYMBOL';
+        " 2>/dev/null && {
+            print_success "完成！已清理 $SYMBOL 的 OPEN 持仓"
+        } || {
+            print_error "清理失败"
+            exit 1
+        }
+    else
+        psql "${DB_URL}" -c "
+        UPDATE positions
+        SET 
+            status = 'CLOSED',
+            updated_at = now(),
+            closed_at_ms = extract(epoch from now())::bigint * 1000,
+            exit_reason = 'MANUAL_CLEANUP'
+        WHERE status = 'OPEN' AND symbol = '$SYMBOL';
+        " 2>/dev/null && {
+            print_success "完成！已清理 $SYMBOL 的 OPEN 持仓"
+        } || {
+            print_error "清理失败"
+            exit 1
+        }
+    fi
 fi
 
 # 验证结果
 echo ""
 print_info "验证清理结果..."
-REMAINING=$(psql "${DB_URL}" -t -c "SELECT COUNT(*) FROM positions WHERE status='OPEN';" 2>/dev/null | tr -d ' ' || echo "0")
+if [ "$USE_DOCKER" = true ]; then
+    REMAINING=$(docker compose exec -T execution psql "$DB_URL" -t -c "SELECT COUNT(*) FROM positions WHERE status='OPEN';" 2>/dev/null | tr -d ' ' || echo "0")
+else
+    REMAINING=$(psql "${DB_URL}" -t -c "SELECT COUNT(*) FROM positions WHERE status='OPEN';" 2>/dev/null | tr -d ' ' || echo "0")
+fi
 if [ "$REMAINING" = "0" ]; then
     print_success "所有 OPEN 持仓已清理"
 else

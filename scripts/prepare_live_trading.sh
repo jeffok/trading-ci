@@ -111,16 +111,26 @@ if command -v psql > /dev/null 2>&1; then
     if psql "$DB_URL" -c "SELECT 1;" > /dev/null 2>&1; then
         print_success "数据库连接正常"
     else
-        print_error "数据库连接失败"
-        echo "   连接字符串: ${DB_URL%%@*}@***"
-        echo "   请检查："
-        echo "   1. DATABASE_URL 格式是否正确"
-        echo "   2. 数据库服务是否运行"
-        echo "   3. 用户名密码是否正确"
-        echo "   4. 数据库是否存在"
-        echo ""
-        echo "   测试命令："
-        echo "   psql \"$DB_URL\" -c \"SELECT 1;\""
+        ERROR_MSG=$(psql "$DB_URL" -c "SELECT 1;" 2>&1 || true)
+        if echo "$ERROR_MSG" | grep -q "SCRAM authentication requires libpq version 10"; then
+            print_warning "本地 psql 版本过旧，不支持 SCRAM 认证"
+            print_info "尝试在 Docker 容器中测试..."
+            if docker compose exec -T execution psql "$DB_URL" -c "SELECT 1;" > /dev/null 2>&1; then
+                print_success "Docker 容器内数据库连接正常（本地 psql 版本过旧不影响使用）"
+            else
+                print_error "Docker 容器内连接也失败"
+                echo "   请检查 DATABASE_URL 配置"
+            fi
+        else
+            print_error "数据库连接失败"
+            echo "   连接字符串: ${DB_URL%%@*}@***"
+            echo "   错误信息: $ERROR_MSG"
+            echo "   请检查："
+            echo "   1. DATABASE_URL 格式是否正确"
+            echo "   2. 数据库服务是否运行"
+            echo "   3. 用户名密码是否正确"
+            echo "   4. 数据库是否存在"
+        fi
         # 不退出，允许继续检查其他项
     fi
 else
