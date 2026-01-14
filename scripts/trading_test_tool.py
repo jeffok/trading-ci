@@ -24,6 +24,7 @@ try:
     from libs.common.time import now_ms
     from libs.db.pg import get_conn
     from libs.bybit.market_rest import BybitMarketRestClient
+    from libs.bybit.trade_rest_v5 import TradeRestV5Client
 except ImportError as e:
     print(f"❌ 导入错误: {e}")
     print("\n💡 提示：在 Docker 容器中运行：")
@@ -693,6 +694,14 @@ def cmd_test(args):
     print(f"  入场价格: {entry_price}")
     print(f"  止损价格: {sl_price}")
     
+    # 自动诊断（如果启用）
+    if args.auto_diagnose:
+        print("\n" + "=" * 60)
+        print("  自动诊断（下单前检查）")
+        print("=" * 60)
+        diagnose_order_failure(args.symbol, args.side)
+        print()
+    
     # 确认
     if not args.confirm:
         print("\n" + "=" * 60)
@@ -809,6 +818,224 @@ def cmd_orders(args):
     
     show_orders(idempotency_key=args.idempotency_key, limit=args.limit)
 
+# ==================== 诊断功能 ====================
+
+def diagnose_order_failure(symbol: str, side: str):
+    """诊断下单失败的原因"""
+    print("=" * 60)
+    print("  下单失败诊断")
+    print("=" * 60)
+    print()
+    
+    symbol_upper = symbol.upper()
+    side_upper = side.upper()
+    
+    issues = []
+    warnings = []
+    
+    # 1. 检查数据库中的 OPEN 持仓
+    print_info("1. 检查数据库中的 OPEN 持仓...")
+    db_positions = []
+    with get_conn(settings.database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 
+                    position_id,
+                    idempotency_key,
+                    symbol,
+                    timeframe,
+                    side,
+                    qty_total,
+                    entry_price,
+                    primary_sl_price,
+                    status,
+                    created_at
+                FROM positions 
+                WHERE status = 'OPEN' AND symbol = %s
+                ORDER BY created_at DESC;
+            """, (symbol_upper,))
+            
+            cols = [desc[0] for desc in cur.description]
+            for row in cur.fetchall():
+                db_positions.append(dict(zip(cols, row)))
+    
+    if db_positions:
+        print_warning(f"   找到 {len(db_positions)} 个数据库中的 OPEN 持仓:")
+        for pos in db_positions:
+            pos_side = pos.get("side", "").upper()
+            print(f"     - {pos['position_id']}: {pos['symbol']} {pos_side} qty={pos['qty_total']}")
+            
+            # 检查是否同方向
+            if pos_side == side_upper:
+                issues.append(f"数据库中存在同方向 OPEN 持仓: {pos['position_id']} ({pos_side})")
+    else:
+        print_success("   数据库中没有 OPEN 持仓")
+    
+    # 2. 检查 Bybit 交易所的实际持仓
+    print_info("\n2. 检查 Bybit 交易所的实际持仓...")
+    try:
+        client = TradeRestV5Client(base_url=settings.bybit_rest_base_url)
+        bybit_positions_resp = client.position_list(
+            category=settings.bybit_category,
+            symbol=symbol_upper
+        )
+        
+        bybit_positions = []
+        if bybit_positions_resp.get("retCode") == 0:
+            result = bybit_positions_resp.get("result", {})
+            bybit_list = result.get("list", [])
+            
+            for pos in bybit_list:
+                size = float(pos.get("size", "0") or "0")
+                if size > 0:
+                    bybit_positions.append({
+                        "symbol": pos.get("symbol", ""),
+                        "side": pos.get("side", ""),
+                        "size": size,
+                        "entry_price": float(pos.get("avgPrice", "0") or "0"),
+                        "mark_price": float(pos.get("markPrice", "0") or "0"),
+                        "unrealised_pnl": float(pos.get("unrealisedPnl", "0") or "0"),
+                    })
+        
+        if bybit_positions:
+            print_warning(f"   Bybit 交易所中有 {len(bybit_positions)} 个实际持仓:")
+            for pos in bybit_positions:
+                bybit_side = pos.get("side", "").upper()
+                print(f"     - {pos['symbol']} {bybit_side} size={pos['size']} entry={pos['entry_price']}")
+                
+                # 检查是否同方向
+                if bybit_side == side_upper:
+                    issues.append(f"Bybit 交易所存在同方向持仓: {pos['symbol']} {bybit_side} size={pos['size']}")
+        else:
+            print_success("   Bybit 交易所中没有持仓")
+            
+        # 检查数据库和交易所的一致性
+        if db_positions and not bybit_positions:
+            warnings.append("数据库中有 OPEN 持仓，但 Bybit 交易所中没有对应持仓（可能是过期持仓）")
+        elif not db_positions and bybit_positions:
+            warnings.append("Bybit 交易所有持仓，但数据库中没有对应记录（需要同步）")
+            
+    except Exception as e:
+        print_error(f"   无法获取 Bybit 持仓: {e}")
+        issues.append(f"无法连接 Bybit API: {e}")
+    
+    # 3. 检查账户余额
+    print_info("\n3. 检查账户余额...")
+    try:
+        client = TradeRestV5Client(base_url=settings.bybit_rest_base_url)
+        wallet_resp = client.wallet_balance(
+            account_type=settings.bybit_account_type,
+            coin="USDT"
+        )
+        
+        if wallet_resp.get("retCode") == 0:
+            result = wallet_resp.get("result", {})
+            wallet_list = result.get("list", [])
+            if wallet_list:
+                coin_list = wallet_list[0].get("coin", [])
+                for coin in coin_list:
+                    if coin.get("coin") == "USDT":
+                        available = float(coin.get("availableToWithdraw", "0") or "0")
+                        equity = float(coin.get("equity", "0") or "0")
+                        print_success(f"   USDT 可用余额: {available:.2f}")
+                        print_info(f"   USDT 总权益: {equity:.2f}")
+                        
+                        if available < 10:
+                            warnings.append(f"账户余额较低: {available:.2f} USDT")
+    except Exception as e:
+        print_error(f"   无法获取账户余额: {e}")
+        warnings.append(f"无法获取账户余额: {e}")
+    
+    # 4. 检查风险控制规则
+    print_info("\n4. 检查风险控制规则...")
+    print(f"   最大持仓数: {settings.max_open_positions}")
+    print(f"   风险百分比: {settings.risk_pct} ({settings.risk_pct * 100}%)")
+    print(f"   账户熔断: {'启用' if settings.account_kill_switch_enabled else '未启用'}")
+    print(f"   风险熔断: {'启用' if settings.risk_circuit_enabled else '未启用'}")
+    
+    # 检查是否达到最大持仓数
+    if db_positions:
+        total_open = len(db_positions)
+        if total_open >= settings.max_open_positions:
+            issues.append(f"已达到最大持仓数限制: {total_open}/{settings.max_open_positions}")
+    
+    # 5. 检查最近的执行报告
+    print_info("\n5. 检查最近的执行报告...")
+    try:
+        r = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+        reports = r.xrevrange("stream:execution_report", max="+", min="-", count=10)
+        
+        recent_reports = []
+        for msg_id, fields in reports:
+            raw_data = fields.get("json") or fields.get("data")
+            if raw_data:
+                try:
+                    evt = json.loads(raw_data)
+                    payload = evt.get("payload", {})
+                    if payload.get("symbol") == symbol_upper:
+                        recent_reports.append({
+                            "status": payload.get("status", ""),
+                            "detail": payload.get("detail", {}),
+                            "ts_ms": evt.get("ts_ms", 0),
+                        })
+                except Exception:
+                    pass
+        
+        if recent_reports:
+            print_warning(f"   找到 {len(recent_reports)} 个相关执行报告:")
+            for rep in recent_reports[:3]:
+                status = rep.get("status", "")
+                detail = rep.get("detail", {})
+                reason = detail.get("reason") or detail.get("error") or "无详情"
+                print(f"     - 状态: {status}, 原因: {reason}")
+        else:
+            print_success("   没有找到相关执行报告")
+    except Exception as e:
+        print_error(f"   无法检查执行报告: {e}")
+    
+    # 6. 总结和建议
+    print("\n" + "=" * 60)
+    print("  诊断总结")
+    print("=" * 60)
+    
+    if issues:
+        print_error("\n❌ 发现的问题（可能导致下单失败）:")
+        for i, issue in enumerate(issues, 1):
+            print(f"   {i}. {issue}")
+    else:
+        print_success("\n✅ 未发现明显问题")
+    
+    if warnings:
+        print_warning("\n⚠️  警告:")
+        for i, warning in enumerate(warnings, 1):
+            print(f"   {i}. {warning}")
+    
+    # 提供修复建议
+    print("\n💡 修复建议:")
+    if any("同方向" in issue for issue in issues):
+        print("   1. 清理同方向的 OPEN 持仓:")
+        print(f"      python -m scripts.trading_test_tool clean --all")
+        print("   2. 或者关闭特定持仓:")
+        print(f"      python -m scripts.trading_test_tool clean <position_id>")
+    
+    if any("最大持仓数" in issue for issue in issues):
+        print("   1. 关闭部分持仓以释放额度")
+        print("   2. 或增加 MAX_OPEN_POSITIONS 配置")
+    
+    if any("过期持仓" in warning for warning in warnings):
+        print("   1. 清理数据库中的过期持仓:")
+        print(f"      python -m scripts.trading_test_tool clean --all")
+    
+    if not issues and not warnings:
+        print("   系统状态正常，如果仍然无法下单，请检查:")
+        print("   1. 执行服务日志: docker compose logs execution | tail -50")
+        print("   2. 风险事件: 检查 stream:risk_event")
+        print("   3. 账户权限: 确认 API Key 有交易权限")
+
+def cmd_diagnose(args):
+    """诊断下单失败命令"""
+    diagnose_order_failure(args.symbol, args.side)
+
 # ==================== 主函数 ====================
 
 def main():
@@ -850,6 +1077,11 @@ def main():
   # 查看订单
   python -m scripts.trading_test_tool orders
   python -m scripts.trading_test_tool orders --idempotency-key idem-xxx
+
+  # 诊断下单失败原因
+  python -m scripts.trading_test_tool diagnose \\
+    --symbol BTCUSDT \\
+    --side BUY
         """
     )
     
@@ -878,11 +1110,17 @@ def main():
     test_parser.add_argument('--timeframe', default='15m', help='时间框架（默认: 15m）')
     test_parser.add_argument('--wait-seconds', type=int, default=30, help='等待执行的时间（秒，默认: 30）')
     test_parser.add_argument('--confirm', action='store_true', help='跳过确认提示（谨慎使用）')
+    test_parser.add_argument('--auto-diagnose', action='store_true', help='下单前自动运行诊断检查')
     
     # orders 命令
     orders_parser = subparsers.add_parser('orders', help='查看订单')
     orders_parser.add_argument('--idempotency-key', help='按 idempotency_key 过滤')
     orders_parser.add_argument('--limit', type=int, default=10, help='限制返回数量（默认: 10）')
+    
+    # diagnose 命令
+    diagnose_parser = subparsers.add_parser('diagnose', help='诊断下单失败原因')
+    diagnose_parser.add_argument('--symbol', required=True, help='交易对，如 BTCUSDT')
+    diagnose_parser.add_argument('--side', required=True, choices=['BUY', 'SELL'], help='方向：BUY 或 SELL')
     
     args = parser.parse_args()
     
@@ -901,6 +1139,8 @@ def main():
         cmd_test(args)
     elif args.command == 'orders':
         cmd_orders(args)
+    elif args.command == 'diagnose':
+        cmd_diagnose(args)
     else:
         parser.print_help()
         sys.exit(1)
