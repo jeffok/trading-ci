@@ -1036,6 +1036,164 @@ def cmd_diagnose(args):
     """诊断下单失败命令"""
     diagnose_order_failure(args.symbol, args.side)
 
+# ==================== 持仓同步功能 ====================
+
+def sync_positions_with_exchange(dry_run: bool = False) -> Dict[str, Any]:
+    """同步数据库持仓与交易所持仓"""
+    print("=" * 60)
+    print("  持仓同步检查")
+    print("=" * 60)
+    print()
+    
+    if str(settings.execution_mode).upper() != "LIVE":
+        print_error("持仓同步仅在 LIVE 模式下可用")
+        return {"synced": 0, "errors": 0, "skipped": 0}
+    
+    try:
+        from services.execution.position_sync import sync_positions
+    except ImportError:
+        print_error("无法导入 position_sync 模块")
+        return {"synced": 0, "errors": 0, "skipped": 0}
+    
+    print_info("正在检查数据库中的 OPEN 持仓...")
+    
+    # 获取所有 OPEN 持仓
+    db_positions = []
+    with get_conn(settings.database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 
+                    position_id,
+                    idempotency_key,
+                    symbol,
+                    timeframe,
+                    side,
+                    qty_total,
+                    entry_price,
+                    status,
+                    created_at
+                FROM positions 
+                WHERE status = 'OPEN'
+                ORDER BY created_at DESC;
+            """)
+            
+            cols = [desc[0] for desc in cur.description]
+            for row in cur.fetchall():
+                db_positions.append(dict(zip(cols, row)))
+    
+    if not db_positions:
+        print_success("数据库中没有 OPEN 持仓，无需同步")
+        return {"synced": 0, "errors": 0, "skipped": 0}
+    
+    print_info(f"找到 {len(db_positions)} 个数据库中的 OPEN 持仓")
+    print()
+    
+    # 检查每个持仓在交易所的状态
+    client = TradeRestV5Client(base_url=settings.bybit_rest_base_url)
+    synced_count = 0
+    error_count = 0
+    skipped_count = 0
+    
+    for pos in db_positions:
+        symbol = pos["symbol"]
+        position_id = pos["position_id"]
+        idem = pos["idempotency_key"]
+        
+        print_info(f"检查持仓: {position_id} ({symbol})")
+        
+        try:
+            # 查询交易所持仓
+            bybit_resp = client.position_list(
+                category=settings.bybit_category,
+                symbol=symbol
+            )
+            
+            if bybit_resp.get("retCode") != 0:
+                print_error(f"  查询失败: {bybit_resp.get('retMsg', '未知错误')}")
+                error_count += 1
+                continue
+            
+            result = bybit_resp.get("result", {})
+            bybit_list = result.get("list", [])
+            
+            # 查找对应持仓
+            exchange_size = 0.0
+            exchange_side = None
+            if bybit_list:
+                for bp in bybit_list:
+                    size = float(bp.get("size", "0") or "0")
+                    if size > 0:
+                        exchange_size = size
+                        exchange_side = bp.get("side", "")
+                        break
+            
+            # 判断是否需要同步
+            if exchange_size == 0:
+                # 交易所中没有持仓，但数据库中是 OPEN，需要关闭
+                print_warning(f"  ⚠️  交易所中已平仓，但数据库中仍为 OPEN")
+                print(f"     数据库状态: OPEN, qty={pos['qty_total']}")
+                print(f"     交易所状态: 已平仓 (size=0)")
+                
+                if not dry_run:
+                    # 直接更新数据库状态
+                    try:
+                        from services.execution.repo import mark_position_closed
+                        from libs.common.time import now_ms
+                        
+                        meta = dict(pos.get("meta") or {})
+                        exit_reason = "MANUAL_CLOSE"  # 手动平仓
+                        
+                        mark_position_closed(
+                            database_url=settings.database_url,
+                            position_id=position_id,
+                            closed_at_ms=now_ms(),
+                            exit_reason=exit_reason,
+                            meta=meta
+                        )
+                        
+                        print_success(f"  ✅ 已同步：将数据库状态更新为 CLOSED (exit_reason={exit_reason})")
+                        synced_count += 1
+                    except Exception as e:
+                        print_error(f"  ❌ 同步失败: {e}")
+                        error_count += 1
+                else:
+                    print_info(f"  [DRY RUN] 将更新为 CLOSED (exit_reason=MANUAL_CLOSE)")
+                    skipped_count += 1
+            else:
+                # 交易所中仍有持仓
+                print_success(f"  ✅ 状态一致：交易所中仍有持仓 (size={exchange_size}, side={exchange_side})")
+                skipped_count += 1
+                
+        except Exception as e:
+            print_error(f"  ❌ 检查失败: {e}")
+            error_count += 1
+        
+        print()
+    
+    # 总结
+    print("=" * 60)
+    print("  同步结果")
+    print("=" * 60)
+    print(f"  已同步: {synced_count}")
+    print(f"  跳过: {skipped_count}")
+    print(f"  错误: {error_count}")
+    
+    if dry_run:
+        print()
+        print_info("这是 DRY RUN 模式，未实际修改数据库")
+        print("  运行不带 --dry-run 参数来实际执行同步")
+    
+    return {
+        "synced": synced_count,
+        "skipped": skipped_count,
+        "errors": error_count,
+        "total": len(db_positions)
+    }
+
+def cmd_sync(args):
+    """持仓同步命令"""
+    sync_positions_with_exchange(dry_run=args.dry_run)
+
 # ==================== 主函数 ====================
 
 def main():
@@ -1082,6 +1240,10 @@ def main():
   python -m scripts.trading_test_tool diagnose \\
     --symbol BTCUSDT \\
     --side BUY
+
+  # 同步持仓（检查并修复不一致）
+  python -m scripts.trading_test_tool sync
+  python -m scripts.trading_test_tool sync --dry-run  # 仅检查，不修改
         """
     )
     
@@ -1122,6 +1284,10 @@ def main():
     diagnose_parser.add_argument('--symbol', required=True, help='交易对，如 BTCUSDT')
     diagnose_parser.add_argument('--side', required=True, choices=['BUY', 'SELL'], help='方向：BUY 或 SELL')
     
+    # sync 命令
+    sync_parser = subparsers.add_parser('sync', help='同步数据库持仓与交易所持仓')
+    sync_parser.add_argument('--dry-run', action='store_true', help='仅检查，不实际修改数据库')
+    
     args = parser.parse_args()
     
     if not args.command:
@@ -1141,6 +1307,8 @@ def main():
         cmd_orders(args)
     elif args.command == 'diagnose':
         cmd_diagnose(args)
+    elif args.command == 'sync':
+        cmd_sync(args)
     else:
         parser.print_help()
         sys.exit(1)
