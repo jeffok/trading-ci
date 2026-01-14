@@ -1,8 +1,72 @@
-# -*- coding: utf-8 -*-
 # Changelog
 
+## [2026-01-14] 修复与改进
 
+### 修复：JSON Schema 验证问题
+- **问题**：执行服务在处理 trade_plan 时出现 `Unresolvable: https://schemas.local/common/event-envelope.json` 错误
+- **原因**：JSON Schema 验证器尝试从网络获取 schema 文件，但 `schemas.local` 域名无法解析
+- **修复**：更新 `libs/mq/schema_validator.py`，使其能够：
+  - 加载所有本地 schema 文件到内存
+  - 创建自定义 RefResolver，将所有 `https://schemas.local/` 的引用映射到本地文件
+  - 避免网络请求，完全使用本地 schema 文件
+- **影响**：修复后需要重启执行服务：`docker compose restart execution`
 
+### 修复：数据库表名不一致问题
+- **问题**：数据库完整性检查报告缺少表 `three_segment_setups`、`entry_triggers`、`pivot_points`
+- **原因**：检查脚本使用了错误的表名，实际表名是 `setups`、`triggers`、`pivots`
+- **修复**：更新 `scripts/check_db_integrity.py` 和 `scripts/check_db_integrity.sh`，使用正确的表名
+- **影响**：数据库完整性检查现在能正确识别所有表
+
+### 改进：统一测试工具
+- **新增**：`scripts/trading_test_tool.py` - 统一的测试工具，整合所有测试功能
+  - `prepare` - 准备检查（配置、服务状态、风险设置）
+  - `positions` - 查看持仓
+  - `clean` - 清理无效持仓
+  - `test` - 执行测试下单（⚠️ 会真实下单）
+  - `orders` - 查看订单
+- **删除**：移除了多个分散的测试脚本，统一使用 `trading_test_tool.py`
+- **文档**：新增 `scripts/README_TEST_TOOL.md` 使用指南
+
+### 文档：同币种同向互斥机制说明
+- **功能**：系统实现了同币种同向互斥保护机制，防止同一交易对同时持有多个同方向仓位
+- **优先级规则**：
+  - 1d: 优先级 3（最高）
+  - 4h: 优先级 2
+  - 1h: 优先级 1
+  - 15m/30m/8h: 优先级 0（最低）
+- **行为**：
+  - 如果 incoming 优先级 ≤ existing 优先级 → 阻止（BLOCK）
+  - 如果 incoming 优先级 > existing 优先级 → 根据 `POSITION_MUTEX_UPGRADE_ACTION` 配置决定行为
+- **配置**：`POSITION_MUTEX_UPGRADE_ACTION`（可选值：`BLOCK` / `CLOSE_LOWER_AND_OPEN`）
+
+### 文档：无效持仓问题处理
+- **问题**：数据库中的持仓状态与交易所实际状态不一致
+- **原因**：
+  - 持仓同步只在 LIVE 模式下运行
+  - 之前使用 PAPER/BACKTEST 模式测试留下的模拟持仓
+  - 手动在交易所平仓但数据库未同步
+- **解决方案**：
+  - 使用 `trading_test_tool.py clean` 命令清理无效持仓
+  - 在 LIVE 模式下，持仓同步每 10 秒自动运行
+- **预防**：切换执行模式前清理 OPEN 持仓
+
+### 文档：交易未执行问题排查
+- **排查步骤**：
+  1. 检查执行服务日志
+  2. 检查消费者状态（Redis Streams）
+  3. 检查执行服务健康状态
+  4. 检查数据库订单和执行报告
+- **常见问题**：
+  - 执行服务未启动或崩溃
+  - 消费者未处理消息（pending 消息堆积）
+  - 执行过程中出错（Schema 验证、API 调用、数据库连接）
+  - Bybit API 配置错误
+  - 风控规则阻止
+
+### 改进：数据库连接兼容性
+- **问题**：本地 `psql` 客户端版本过旧，不支持 SCRAM 认证
+- **修复**：多个脚本增加了自动检测，当本地 `psql` 不支持 SCRAM 时，自动使用 Docker 容器内的 `psql`
+- **影响**：提高了脚本在不同环境下的兼容性
 
 ## [2026-01-14] Stage 11：数据质量监控 + ATR/NEWS 市场状态 + Kill Switch + Signals 生命周期
 - marketdata-service：接入 gapfill 幂等发布（bar_close_emits）并补齐 DATA_GAP 回填链路；新增 DATA_LAG/BAR_DUPLICATE/PRICE_JUMP/VOLUME_ANOMALY 数据质量告警
