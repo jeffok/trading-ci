@@ -14,7 +14,7 @@
 ### 修复：数据库表名不一致问题
 - **问题**：数据库完整性检查报告缺少表 `three_segment_setups`、`entry_triggers`、`pivot_points`
 - **原因**：检查脚本使用了错误的表名，实际表名是 `setups`、`triggers`、`pivots`
-- **修复**：更新 `scripts/check_db_integrity.py` 和 `scripts/check_db_integrity.sh`，使用正确的表名
+- **修复**：更新 `scripts/check_db_integrity.py`，使用正确的表名
 - **影响**：数据库完整性检查现在能正确识别所有表
 
 ### 改进：统一测试工具

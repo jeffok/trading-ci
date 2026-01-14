@@ -23,7 +23,7 @@ try:
     from libs.common.config import settings
     from libs.common.time import now_ms
     from libs.db.pg import get_conn
-    from libs.bybit.market_rest import BybitMarketRestClient
+    from libs.bybit.market_rest import BybitMarketRestClient, MarketRestV5Client
     from libs.bybit.trade_rest_v5 import TradeRestV5Client
 except ImportError as e:
     print(f"❌ 导入错误: {e}")
@@ -1194,6 +1194,695 @@ def cmd_sync(args):
     """持仓同步命令"""
     sync_positions_with_exchange(dry_run=args.dry_run)
 
+# ==================== 平仓测试功能 ====================
+
+def cmd_close_test(args):
+    """平仓测试命令（PAPER/BACKTEST 模式）"""
+    print("=" * 60)
+    print("  平仓测试（E2E Stage 2）")
+    print("=" * 60)
+    print()
+    
+    mode = str(settings.execution_mode).upper()
+    if mode not in ("PAPER", "BACKTEST"):
+        print_warning(f"当前模式: {mode}，建议使用 PAPER 或 BACKTEST 模式")
+        response = input("是否继续？(yes/no): ")
+        if response.lower() != "yes":
+            return
+    
+    try:
+        r = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+        r.ping()
+    except Exception as e:
+        print_error(f"Redis 连接失败: {e}")
+        sys.exit(1)
+    
+    # 构建 trade_plan
+    symbol = args.symbol.upper()
+    timeframe = args.timeframe
+    side = args.side.upper()
+    entry_price = args.entry_price
+    sl_price = args.sl_price
+    
+    print_info("构建 trade_plan...")
+    event = build_trade_plan(
+        symbol=symbol,
+        timeframe=timeframe,
+        side=side,
+        entry_price=entry_price,
+        sl_price=sl_price,
+        env=settings.env,
+    )
+    
+    plan_id = event["payload"]["plan_id"]
+    idem = event["payload"]["idempotency_key"]
+    
+    print_success(f"Plan ID: {plan_id}")
+    print_success(f"Idempotency Key: {idem}")
+    
+    # 发布 trade_plan
+    print_info("发布 trade_plan 到 Redis Streams...")
+    msg_id = publish_event(r, "stream:trade_plan", event, event_type="TRADE_PLAN")
+    print_success(f"已发布，消息 ID: {msg_id}")
+    
+    # 等待持仓创建
+    print_info(f"等待 {args.wait_before_close} 秒让持仓创建...")
+    time.sleep(args.wait_before_close)
+    
+    # 强制平仓
+    print_info("强制平仓（PAPER/BACKTEST 模式）...")
+    try:
+        from services.execution.executor import close_position_market
+        
+        close_position_market(
+            database_url=settings.database_url,
+            redis_url=settings.redis_url,
+            idempotency_key=idem,
+            symbol=symbol,
+            side=side,
+            close_price=args.close_price,
+            close_time_ms=now_ms(),
+            reason="close_test_force_close",
+        )
+        print_success("平仓请求已发送")
+    except Exception as e:
+        print_error(f"平仓失败: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # 等待报告生成
+    print_info(f"等待 {args.wait_after_close} 秒让报告生成...")
+    time.sleep(args.wait_after_close)
+    
+    # 检查执行报告
+    print_info("检查执行报告...")
+    reports = r.xrevrange("stream:execution_report", max="+", min="-", count=200)
+    related_reports = []
+    for msg_id, fields in reports:
+        raw_data = fields.get("json") or fields.get("data")
+        if raw_data:
+            try:
+                evt = json.loads(raw_data)
+                payload = evt.get("payload", {})
+                if payload.get("plan_id") == plan_id or payload.get("idempotency_key") == idem:
+                    related_reports.append(evt)
+            except Exception:
+                pass
+    
+    if related_reports:
+        print_success(f"找到 {len(related_reports)} 个相关执行报告:")
+        for i, rep in enumerate(related_reports[:10], 1):
+            payload = rep.get("payload", {})
+            print(f"  {i}. {payload.get('status')} - {payload.get('symbol')}")
+            detail = payload.get("detail", {})
+            if isinstance(detail, dict):
+                pnl = detail.get("pnl_usdt")
+                if pnl is not None:
+                    print(f"     PnL: {pnl:.2f} USDT")
+    else:
+        print_warning("未找到相关执行报告")
+    
+    # 检查风险事件
+    print_info("检查风险事件...")
+    risk_events = r.xrevrange("stream:risk_event", max="+", min="-", count=50)
+    related_risks = []
+    for msg_id, fields in risk_events:
+        raw_data = fields.get("json") or fields.get("data")
+        if raw_data:
+            try:
+                evt = json.loads(raw_data)
+                payload = evt.get("payload", {})
+                detail = payload.get("detail", {})
+                if isinstance(detail, dict):
+                    if detail.get("idempotency_key") == idem:
+                        related_risks.append(evt)
+            except Exception:
+                pass
+    
+    if related_risks:
+        print_warning(f"找到 {len(related_risks)} 个相关风险事件")
+    else:
+        print_success("未找到相关风险事件")
+    
+    print()
+    print_success("平仓测试完成！")
+    print_info("如果配置了 Telegram，应该会收到包含 PnL 和连续亏损统计的平仓消息")
+
+# ==================== 风控测试功能 ====================
+
+def cmd_gates_test(args):
+    """风控闸门测试命令（PAPER/BACKTEST 模式）"""
+    print("=" * 60)
+    print("  风控闸门测试（E2E Stage 6）")
+    print("=" * 60)
+    print()
+    
+    mode = str(settings.execution_mode).upper()
+    if mode not in ("PAPER", "BACKTEST"):
+        print_warning(f"当前模式: {mode}，建议使用 PAPER 或 BACKTEST 模式")
+        response = input("是否继续？(yes/no): ")
+        if response.lower() != "yes":
+            return
+    
+    try:
+        r = redis.Redis.from_url(settings.redis_url, decode_responses=False)
+        r.ping()
+    except Exception as e:
+        print_error(f"Redis 连接失败: {e}")
+        sys.exit(1)
+    
+    # 重置数据库（如果指定）
+    if args.reset_db:
+        print_warning("重置数据库（TRUNCATE execution tables）...")
+        try:
+            import psycopg
+            with psycopg.connect(settings.database_url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("TRUNCATE TABLE orders, positions, cooldowns, execution_reports, risk_events, backtest_trades RESTART IDENTITY CASCADE;")
+                conn.commit()
+            print_success("数据库已重置")
+            time.sleep(1)
+        except Exception as e:
+            print_error(f"重置数据库失败: {e}")
+            sys.exit(1)
+    
+    def _xlast(stream: str) -> str:
+        try:
+            xs = r.xrevrange(stream, count=1)
+            if xs:
+                return xs[0][0].decode() if isinstance(xs[0][0], (bytes, bytearray)) else str(xs[0][0])
+        except Exception:
+            pass
+        return "0-0"
+    
+    def _collect(stream: str, start_id: str, predicate, timeout_s: int = 15) -> List[Dict[str, Any]]:
+        end = time.time() + timeout_s
+        cur = start_id
+        out: List[Dict[str, Any]] = []
+        while time.time() < end:
+            resp = r.xread({stream: cur}, count=100, block=500)
+            if not resp:
+                continue
+            for _stream_name, items in resp:
+                for xid, fields in items:
+                    cur = xid.decode() if isinstance(xid, (bytes, bytearray)) else str(xid)
+                    raw = fields.get(b"json") or fields.get("json")
+                    if raw is None:
+                        continue
+                    try:
+                        obj = json.loads(raw.decode() if isinstance(raw, (bytes, bytearray)) else raw)
+                    except Exception:
+                        continue
+                    if predicate(obj):
+                        out.append(obj)
+            if out:
+                break
+        return out
+    
+    def _build_trade_plan(symbol: str, timeframe: str, side: str, entry: float, sl: float, close_time_ms: int) -> Dict[str, Any]:
+        plan_id = f"stage6-{uuid.uuid4().hex[:10]}"
+        idem = f"idem-{uuid.uuid4().hex}"
+        return {
+            "event_id": f"evt-{uuid.uuid4().hex}",
+            "ts_ms": now_ms(),
+            "env": settings.env,
+            "service": "e2e-stage6",
+            "payload": {
+                "plan_id": plan_id,
+                "idempotency_key": idem,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "side": side,
+                "entry_price": float(entry),
+                "primary_sl_price": float(sl),
+                "risk_pct": 0.005,
+                "close_time_ms": int(close_time_ms),
+                "tp_rules": {
+                    "tp1": {"r": 1.0, "pct": 0.4},
+                    "tp2": {"r": 2.0, "pct": 0.4},
+                    "tp3_trail": {"pct": 0.2, "mode": "ATR"},
+                    "reduce_only": True,
+                },
+                "secondary_sl_rule": {"type": "NEXT_BAR_NOT_SHORTEN_EXIT"},
+                "traceability": {"setup_id": "stage6", "trigger_id": "stage6"},
+                "ext": {"run_id": "stage6-test"},
+            },
+        }
+    
+    def _build_bar_close(symbol: str, timeframe: str, close_time_ms: int, o: float, h: float, l: float, c: float) -> Dict[str, Any]:
+        return {
+            "event_id": f"evt-{uuid.uuid4().hex}",
+            "ts_ms": now_ms(),
+            "env": settings.env,
+            "service": "e2e-stage6",
+            "payload": {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "close_time_ms": int(close_time_ms),
+                "is_final": True,
+                "source": "bybit_ws",
+                "ohlcv": {"open": float(o), "high": float(h), "low": float(l), "close": float(c), "volume": 1.0},
+                "ext": {"run_id": "stage6-test"},
+            },
+        }
+    
+    # 测试1: MAX_POSITIONS_BLOCKED
+    print_info("[T1] 测试最大持仓数限制（第4个应该被拒绝）...")
+    start_rep = _xlast("stream:execution_report")
+    start_risk = _xlast("stream:risk_event")
+    base_t = now_ms()
+    syms = ["BTCUSDT", "ETHUSDT", "BCHUSDT", "LTCUSDT"]
+    idems: List[str] = []
+    
+    for i, s in enumerate(syms):
+        ev = _build_trade_plan(symbol=s, timeframe="1h", side="BUY", entry=100 + i, sl=90 + i, close_time_ms=base_t + i * 3600000)
+        idems.append(ev["payload"]["idempotency_key"])
+        publish_event(r, "stream:trade_plan", ev, event_type="trade_plan")
+        time.sleep(0.2)
+    
+    rejected = _collect(
+        "stream:execution_report",
+        start_rep,
+        lambda obj: (obj.get("payload") or {}).get("idempotency_key") == idems[-1]
+        and str((obj.get("payload") or {}).get("status") or "").upper() in ("REJECTED", "ORDER_REJECTED", "ERROR"),
+        timeout_s=args.wait,
+    )
+    if not rejected:
+        print_error("T1 失败: 第4个计划未被拒绝")
+        sys.exit(1)
+    print_success("T1 通过: 第4个计划被正确拒绝")
+    
+    risk_max = _collect(
+        "stream:risk_event",
+        start_risk,
+        lambda obj: str((obj.get("payload") or {}).get("type") or "").upper() == "MAX_POSITIONS_BLOCKED",
+        timeout_s=args.wait,
+    )
+    if not risk_max:
+        print_error("T1 失败: 未生成 MAX_POSITIONS_BLOCKED 风险事件")
+        sys.exit(1)
+    print_success("T1 通过: 生成了 MAX_POSITIONS_BLOCKED 风险事件")
+    
+    # 测试2: mutex upgrade
+    print_info("[T2] 测试同币种同向互斥升级（4h 应该关闭 1h 并开新仓）...")
+    if args.reset_db:
+        import psycopg
+        with psycopg.connect(settings.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE TABLE orders, positions, cooldowns, execution_reports, risk_events, backtest_trades RESTART IDENTITY CASCADE;")
+            conn.commit()
+        time.sleep(1)
+    
+    start_rep = _xlast("stream:execution_report")
+    base_t = now_ms()
+    ev1 = _build_trade_plan(symbol="BTCUSDT", timeframe="1h", side="BUY", entry=200, sl=180, close_time_ms=base_t)
+    ev2 = _build_trade_plan(symbol="BTCUSDT", timeframe="4h", side="BUY", entry=200, sl=180, close_time_ms=base_t + 4 * 3600000)
+    idem1 = ev1["payload"]["idempotency_key"]
+    idem2 = ev2["payload"]["idempotency_key"]
+    publish_event(r, "stream:trade_plan", ev1, event_type="trade_plan")
+    time.sleep(0.5)
+    publish_event(r, "stream:trade_plan", ev2, event_type="trade_plan")
+    
+    exited1 = _collect(
+        "stream:execution_report",
+        start_rep,
+        lambda obj: (obj.get("payload") or {}).get("idempotency_key") == idem1
+        and str((obj.get("payload") or {}).get("status") or "").upper() in ("EXITED", "POSITION_CLOSED", "PRIMARY_SL_HIT", "SECONDARY_SL_EXIT"),
+        timeout_s=args.wait,
+    )
+    if not exited1:
+        print_error("T2 失败: 低时间框架持仓未被关闭")
+        sys.exit(1)
+    print_success("T2 通过: 低时间框架持仓被关闭")
+    
+    filled2 = _collect(
+        "stream:execution_report",
+        start_rep,
+        lambda obj: (obj.get("payload") or {}).get("idempotency_key") == idem2
+        and str((obj.get("payload") or {}).get("status") or "").upper() in ("FILLED", "ORDER_SUBMITTED"),
+        timeout_s=args.wait,
+    )
+    if not filled2:
+        print_error("T2 失败: 高时间框架计划未执行")
+        sys.exit(1)
+    print_success("T2 通过: 高时间框架计划成功执行")
+    
+    # 测试3: cooldown
+    print_info("[T3] 测试冷却期功能（止损后重新入场应该被阻止）...")
+    import psycopg
+    with psycopg.connect(settings.database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE TABLE orders, positions, cooldowns, execution_reports, risk_events, backtest_trades RESTART IDENTITY CASCADE;")
+        conn.commit()
+    time.sleep(1)
+    
+    start_rep = _xlast("stream:execution_report")
+    start_risk = _xlast("stream:risk_event")
+    base_t = now_ms()
+    ev = _build_trade_plan(symbol="BTCUSDT", timeframe="1h", side="BUY", entry=100, sl=90, close_time_ms=base_t)
+    idem = ev["payload"]["idempotency_key"]
+    publish_event(r, "stream:trade_plan", ev, event_type="trade_plan")
+    time.sleep(1)
+    
+    # 发布触发止损的 bar_close
+    bc = _build_bar_close(symbol="BTCUSDT", timeframe="1h", close_time_ms=base_t + 3600000, o=100, h=100, l=80, c=85)
+    publish_event(r, "stream:bar_close", bc, event_type="bar_close")
+    
+    sl_rep = _collect(
+        "stream:execution_report",
+        start_rep,
+        lambda obj: (obj.get("payload") or {}).get("idempotency_key") == idem
+        and str((obj.get("payload") or {}).get("status") or "").upper() in ("PRIMARY_SL_HIT", "SECONDARY_SL_EXIT", "POSITION_CLOSED"),
+        timeout_s=args.wait,
+    )
+    if not sl_rep:
+        print_error("T3 失败: 未生成止损平仓报告")
+        sys.exit(1)
+    print_success("T3 通过: 止损平仓报告已生成")
+    
+    # 尝试在冷却期内重新入场
+    start_rep2 = _xlast("stream:execution_report")
+    ev_re = _build_trade_plan(symbol="BTCUSDT", timeframe="1h", side="BUY", entry=100, sl=90, close_time_ms=base_t + 3600000)
+    idem_re = ev_re["payload"]["idempotency_key"]
+    publish_event(r, "stream:trade_plan", ev_re, event_type="trade_plan")
+    
+    reject_cd = _collect(
+        "stream:execution_report",
+        start_rep2,
+        lambda obj: (obj.get("payload") or {}).get("idempotency_key") == idem_re
+        and str((obj.get("payload") or {}).get("status") or "").upper() == "REJECTED",
+        timeout_s=args.wait,
+    )
+    if not reject_cd:
+        print_error("T3 失败: 冷却期内重新入场未被拒绝")
+        sys.exit(1)
+    
+    risk_cd = _collect(
+        "stream:risk_event",
+        start_risk,
+        lambda obj: str((obj.get("payload") or {}).get("type") or "").upper() == "COOLDOWN_BLOCKED",
+        timeout_s=args.wait,
+    )
+    if not risk_cd:
+        print_error("T3 失败: 未生成 COOLDOWN_BLOCKED 风险事件")
+        sys.exit(1)
+    print_success("T3 通过: 冷却期成功阻止重新入场")
+    
+    print()
+    print_success("所有风控闸门测试通过！✅")
+
+# ==================== 回放回测功能 ====================
+
+def cmd_replay(args):
+    """回放回测命令"""
+    print("=" * 60)
+    print("  回放回测")
+    print("=" * 60)
+    print()
+    
+    try:
+        from libs.common.logging import setup_logging
+        from libs.mq.redis_streams import RedisStreamsClient
+        from libs.mq.events import publish_event
+        from services.marketdata.publisher import build_bar_close_event
+        from services.marketdata.repo_bars import upsert_bar
+        from services.strategy.repo import get_bars, get_bars_range
+        from libs.backtest.repo import insert_backtest_run, list_backtest_trades
+        import hashlib
+    except ImportError as e:
+        print_error(f"导入失败: {e}")
+        sys.exit(1)
+    
+    setup_logging("scripts/replay_backtest")
+    
+    symbol = args.symbol.upper()
+    tf = args.timeframe
+    
+    def _gen_run_id(symbol: str, timeframe: str) -> str:
+        seed = f"{symbol}|{timeframe}|{now_ms()}"
+        return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+    
+    def _fetch_and_upsert(symbol: str, interval: str, limit: int) -> None:
+        """从 Bybit REST 拉取最近 N 根（近似）并写库。"""
+        from libs.bybit.market_rest import BybitMarketRestClient
+        client = BybitMarketRestClient(base_url=settings.bybit_rest_base_url)
+        bars = client.get_kline(symbol=symbol, interval=interval, limit=limit)
+        bars = list(reversed(bars))
+        for b in bars:
+            start_ms = int(b["start_ms"])
+            o = float(b["open"]); h = float(b["high"]); l = float(b["low"]); c = float(b["close"])
+            v = float(b["volume"]); t = float(b.get("turnover")) if b.get("turnover") is not None else None
+            if interval.isdigit():
+                close_ms = start_ms + int(interval) * 60_000
+            elif interval.upper() == "D":
+                close_ms = start_ms + 24 * 60 * 60_000
+            else:
+                close_ms = start_ms
+            upsert_bar(settings.database_url, symbol=symbol, timeframe=interval, open_time_ms=start_ms, close_time_ms=close_ms,
+                       open=o, high=h, low=l, close=c, volume=v, turnover=t, source="REST")
+    
+    run_id = args.run_id or _gen_run_id(symbol, tf)
+    
+    if args.fetch:
+        print_info(f"从 Bybit REST 拉取 {args.fetch_limit} 根 K 线...")
+        _fetch_and_upsert(symbol, tf, args.fetch_limit)
+        print_success("K 线数据已写入数据库")
+    
+    # 选择 bars
+    bars: List[Dict[str, Any]] = []
+    if args.start_ms and args.end_ms:
+        bars = get_bars_range(settings.database_url, symbol=symbol, timeframe=tf, start_close_time_ms=args.start_ms, end_close_time_ms=args.end_ms)
+    else:
+        lim = int(args.limit or 0)
+        if lim <= 0:
+            print_error("请使用 --limit 或 --start-ms/--end-ms 指定回放范围")
+            sys.exit(1)
+        bars = list(reversed(get_bars(settings.database_url, symbol=symbol, timeframe=tf, limit=lim)))
+    
+    if not bars:
+        print_error("bars 为空：请确认 bars 表已写入或使用 --fetch")
+        sys.exit(1)
+    
+    client = RedisStreamsClient(settings.redis_url)
+    
+    print_info(f"Run ID: {run_id}")
+    print_info(f"Bars 数量: {len(bars)}")
+    print_info(f"Symbol: {symbol}")
+    print_info(f"Timeframe: {tf}")
+    print()
+    
+    # 发布 bar_close
+    print_info("开始回放 bar_close 事件...")
+    for i, b in enumerate(bars, start=1):
+        evt = build_bar_close_event(
+            symbol=symbol,
+            timeframe=tf,
+            close_time_ms=int(b["close_time_ms"]),
+            source="REPLAY",
+            ohlcv=[float(b["open"]), float(b["high"]), float(b["low"]), float(b["close"]), float(b["volume"])],
+        )
+        evt["payload"]["ext"] = {"run_id": run_id, "seq": i}
+        publish_event(client, "stream:bar_close", evt, event_type="bar_close")
+        if args.sleep_ms > 0:
+            time.sleep(args.sleep_ms / 1000.0)
+        
+        if i % 100 == 0:
+            print_info(f"已回放 {i}/{len(bars)} 根 K 线...")
+    
+    print_success(f"已回放 {len(bars)} 根 K 线")
+    
+    # 生成并落库 backtest_run
+    try:
+        trades = list_backtest_trades(settings.database_url, run_id=run_id)
+        if trades:
+            total = len(trades)
+            win = sum(1 for t in trades if float(t.get("pnl_r") or 0.0) > 0)
+            avg = sum(float(t.get("pnl_r") or 0.0) for t in trades) / max(total, 1)
+            summary = {"trades": total, "win_rate": win / max(total, 1), "avg_pnl_r": avg}
+        else:
+            summary = {"trades": 0, "win_rate": 0.0, "avg_pnl_r": 0.0}
+        
+        insert_backtest_run(
+            settings.database_url,
+            run_id=run_id,
+            name=f"REPLAY_{symbol}_{tf}",
+            params={"mode": "REPLAY", "symbol": symbol, "timeframe": tf, "bars": len(bars)},
+            summary=summary,
+        )
+        print_success(f"回测运行记录已创建: run_id={run_id}")
+    except Exception as e:
+        print_warning(f"创建回测运行记录失败: {e}")
+    
+    print()
+    print_success("回放回测完成！")
+    print_info(f"建议使用 /v1/backtest-compare?run_id={run_id} 检查闭环进度")
+
+# ==================== 限流器自测功能 ====================
+
+def cmd_ratelimit_test(args):
+    """限流器自测命令"""
+    print("=" * 60)
+    print("  限流器自测")
+    print("=" * 60)
+    print()
+    
+    try:
+        from libs.bybit.ratelimit import EndpointGroup, get_rate_limiter
+        import random
+    except ImportError as e:
+        print_error(f"导入失败: {e}")
+        sys.exit(1)
+    
+    rl = get_rate_limiter(settings)
+    
+    symbols = ["BTCUSDT", "ETHUSDT", "BCHUSDT", "SOLUSDT", "XRPUSDT"]
+    
+    print_info("限流器配置:")
+    print(f"  max_wait_ms={rl.max_wait_ms}")
+    print(f"  low_status_threshold={rl.low_status_threshold}")
+    print()
+    print_info("环境变量覆盖:")
+    for k in [
+        "BYBIT_PUBLIC_RPS",
+        "BYBIT_PRIVATE_CRITICAL_RPS",
+        "BYBIT_PRIVATE_ORDER_QUERY_RPS",
+        "BYBIT_PRIVATE_ACCOUNT_QUERY_RPS",
+        "BYBIT_PRIVATE_PER_SYMBOL_ORDER_QUERY_RPS",
+        "BYBIT_PRIVATE_PER_SYMBOL_ACCOUNT_QUERY_RPS",
+        "BYBIT_RATE_LIMIT_MAX_WAIT_MS",
+    ]:
+        val = getattr(settings, k.lower(), None)
+        print(f"    {k}={val}")
+    print()
+    
+    stats = {"crit_wait_ms": [], "order_query_wait_ms": [], "account_query_wait_ms": []}
+    
+    print_info("开始模拟请求（200 次）...")
+    start = time.time()
+    for i in range(200):
+        sym = random.choice(symbols)
+        r = random.random()
+        if r < 0.25:
+            gw, sw = rl.acquire(group=EndpointGroup.PRIVATE_CRITICAL, symbol=sym)
+            w = max(gw, sw)
+            stats["crit_wait_ms"].append(w)
+        elif r < 0.70:
+            gw, sw = rl.acquire(group=EndpointGroup.PRIVATE_ORDER_QUERY, symbol=sym)
+            w = max(gw, sw)
+            stats["order_query_wait_ms"].append(w)
+        else:
+            gw, sw = rl.acquire(group=EndpointGroup.PRIVATE_ACCOUNT_QUERY, symbol=sym)
+            w = max(gw, sw)
+            stats["account_query_wait_ms"].append(w)
+        
+        if i % 50 == 0 and i > 0:
+            time.sleep(0.4)
+    
+    elapsed = (time.time() - start) * 1000
+    
+    def p(xs, q):
+        if not xs:
+            return 0
+        xs2 = sorted(xs)
+        idx = int((len(xs2) - 1) * q)
+        return xs2[idx]
+    
+    print()
+    print_info("结果统计（毫秒）:")
+    for k in ["crit_wait_ms", "order_query_wait_ms", "account_query_wait_ms"]:
+        xs = stats[k]
+        if xs:
+            mean = sum(xs) / len(xs)
+            print(f"  {k}:")
+            print(f"    n={len(xs)}")
+            print(f"    mean={mean:.1f}")
+            print(f"    p50={p(xs, 0.50)}")
+            print(f"    p90={p(xs, 0.90)}")
+            print(f"    p99={p(xs, 0.99)}")
+            print(f"    max={max(xs)}")
+        else:
+            print(f"  {k}: n=0")
+    
+    print()
+    print_success(f"完成，耗时: {elapsed:.0f}ms")
+
+# ==================== WebSocket 处理自测功能 ====================
+
+def cmd_ws_test(args):
+    """WebSocket 处理自测命令"""
+    print("=" * 60)
+    print("  WebSocket 处理自测")
+    print("=" * 60)
+    print()
+    
+    try:
+        import asyncio
+        from services.execution.ws_private_ingest import handle_private_ws_message
+    except ImportError as e:
+        print_error(f"导入失败: {e}")
+        sys.exit(1)
+    
+    SAMPLES = [
+        {
+            "topic": "order",
+            "data": [{
+                "symbol": "BCHUSDT",
+                "orderId": "abc",
+                "orderLinkId": "link_1",
+                "orderStatus": "PartiallyFilled",
+                "cumExecQty": "0.5",
+                "avgPrice": "617.5"
+            }]
+        },
+        {
+            "topic": "execution",
+            "data": [{
+                "symbol": "BCHUSDT",
+                "orderId": "abc",
+                "orderLinkId": "link_1",
+                "execId": "e1",
+                "execQty": "0.5",
+                "execPrice": "617.5",
+                "cumExecQty": "0.5",
+                "leavesQty": "0.71"
+            }]
+        },
+        {
+            "topic": "position",
+            "data": [{
+                "symbol": "BCHUSDT",
+                "side": "Buy",
+                "size": "1.21",
+                "entryPrice": "617.5"
+            }]
+        },
+        {
+            "topic": "wallet",
+            "data": [{
+                "coin": [{"coin": "USDT", "walletBalance": "1000"}]
+            }]
+        }
+    ]
+    
+    async def run_test():
+        for i, m in enumerate(SAMPLES, start=1):
+            topic = m.get('topic')
+            print_info(f"测试样本 {i}: topic={topic}")
+            try:
+                await handle_private_ws_message(m)
+                print_success(f"样本 {i} 处理成功")
+            except Exception as e:
+                print_error(f"样本 {i} 处理失败: {e}")
+                import traceback
+                traceback.print_exc()
+            print()
+    
+    print_info("开始测试 WebSocket 消息处理...")
+    print()
+    asyncio.run(run_test())
+    print_success("WebSocket 处理自测完成！")
+
 # ==================== 主函数 ====================
 
 def main():
@@ -1244,6 +1933,23 @@ def main():
   # 同步持仓（检查并修复不一致）
   python -m scripts.trading_test_tool sync
   python -m scripts.trading_test_tool sync --dry-run  # 仅检查，不修改
+
+  # 平仓测试（PAPER/BACKTEST 模式）
+  python -m scripts.trading_test_tool close-test \\
+    --symbol BTCUSDT --side BUY --entry-price 30000 --sl-price 29000
+
+  # 风控闸门测试（PAPER/BACKTEST 模式）
+  python -m scripts.trading_test_tool gates-test --reset-db
+
+  # 回放回测
+  python -m scripts.trading_test_tool replay \\
+    --symbol BTCUSDT --timeframe 60 --limit 2000
+
+  # 限流器自测
+  python -m scripts.trading_test_tool ratelimit-test
+
+  # WebSocket 处理自测
+  python -m scripts.trading_test_tool ws-test
         """
     )
     
@@ -1288,6 +1994,40 @@ def main():
     sync_parser = subparsers.add_parser('sync', help='同步数据库持仓与交易所持仓')
     sync_parser.add_argument('--dry-run', action='store_true', help='仅检查，不实际修改数据库')
     
+    # close-test 命令
+    close_test_parser = subparsers.add_parser('close-test', help='平仓测试（PAPER/BACKTEST 模式）')
+    close_test_parser.add_argument('--symbol', default='BCHUSDT', help='交易对（默认: BCHUSDT）')
+    close_test_parser.add_argument('--side', default='SELL', choices=['BUY', 'SELL'], help='方向（默认: SELL）')
+    close_test_parser.add_argument('--timeframe', default='15m', help='时间框架（默认: 15m）')
+    close_test_parser.add_argument('--entry-price', type=float, default=617.5, help='入场价格（默认: 617.5）')
+    close_test_parser.add_argument('--sl-price', type=float, default=630.0, help='止损价格（默认: 630.0）')
+    close_test_parser.add_argument('--wait-before-close', type=int, default=3, help='持仓创建后等待时间（秒，默认: 3）')
+    close_test_parser.add_argument('--wait-after-close', type=int, default=3, help='平仓后等待时间（秒，默认: 3）')
+    close_test_parser.add_argument('--close-price', type=float, default=623.7579, help='强制平仓价格（默认: 623.7579）')
+    
+    # gates-test 命令
+    gates_test_parser = subparsers.add_parser('gates-test', help='风控闸门测试（PAPER/BACKTEST 模式）')
+    gates_test_parser.add_argument('--reset-db', action='store_true', help='测试前重置数据库（TRUNCATE execution tables）')
+    gates_test_parser.add_argument('--wait', type=int, default=10, help='等待超时时间（秒，默认: 10）')
+    
+    # replay 命令
+    replay_parser = subparsers.add_parser('replay', help='回放回测（使用历史 bars 回放 bar_close 事件）')
+    replay_parser.add_argument('--symbol', required=True, help='交易对，如 BTCUSDT')
+    replay_parser.add_argument('--timeframe', required=True, help='时间框架，如 60(1h)/240(4h)/D(1d)')
+    replay_parser.add_argument('--limit', type=int, default=0, help='从 DB 读取最近 N 根 bars 回放')
+    replay_parser.add_argument('--start-ms', type=int, default=0, help='开始时间（毫秒时间戳）')
+    replay_parser.add_argument('--end-ms', type=int, default=0, help='结束时间（毫秒时间戳）')
+    replay_parser.add_argument('--run-id', default='', help='运行 ID（可选，默认自动生成）')
+    replay_parser.add_argument('--sleep-ms', type=int, default=0, help='每次发布事件后的延迟（毫秒，默认: 0）')
+    replay_parser.add_argument('--fetch', action='store_true', help='先从 Bybit REST 拉取 bars 写库')
+    replay_parser.add_argument('--fetch-limit', type=int, default=2000, help='拉取的 bars 数量（默认: 2000）')
+    
+    # ratelimit-test 命令
+    subparsers.add_parser('ratelimit-test', help='限流器自测（不调用 Bybit，仅测试限流逻辑）')
+    
+    # ws-test 命令
+    subparsers.add_parser('ws-test', help='WebSocket 处理自测（测试消息解析与路由）')
+    
     args = parser.parse_args()
     
     if not args.command:
@@ -1309,6 +2049,16 @@ def main():
         cmd_diagnose(args)
     elif args.command == 'sync':
         cmd_sync(args)
+    elif args.command == 'close-test':
+        cmd_close_test(args)
+    elif args.command == 'gates-test':
+        cmd_gates_test(args)
+    elif args.command == 'replay':
+        cmd_replay(args)
+    elif args.command == 'ratelimit-test':
+        cmd_ratelimit_test(args)
+    elif args.command == 'ws-test':
+        cmd_ws_test(args)
     else:
         parser.print_help()
         sys.exit(1)

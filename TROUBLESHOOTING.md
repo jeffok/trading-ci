@@ -309,7 +309,7 @@ curl http://localhost:8000/v1/trade-plans
 
 ```bash
 # 运行诊断脚本（如果已创建）
-./scripts/diagnose_test.sh
+docker compose exec execution python -m scripts.trading_test_tool diagnose --symbol BTCUSDT --side BUY
 ```
 
 ### 步骤2：检查服务状态

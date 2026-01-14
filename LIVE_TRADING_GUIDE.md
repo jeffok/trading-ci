@@ -18,10 +18,10 @@
 
 ```bash
 # 查看当前持仓
-./scripts/fix_stale_positions_simple.sh --dry-run
+docker compose exec execution python -m scripts.trading_test_tool positions
 
 # 清理无效持仓（如果存在）
-./scripts/fix_stale_positions_simple.sh --force
+docker compose exec execution python -m scripts.trading_test_tool clean --all --yes
 
 # 验证清理结果
 curl "http://localhost:8000/v1/positions?limit=10" | python3 -m json.tool

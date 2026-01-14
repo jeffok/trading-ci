@@ -9,7 +9,8 @@
 1. [系统测试](#系统测试)
 2. [功能测试](#功能测试)
 3. [实盘测试](#实盘测试)
-4. [测试检查清单](#测试检查清单)
+4. [测试工具完整命令列表](#测试工具完整命令列表)
+5. [测试检查清单](#测试检查清单)
 
 ---
 
@@ -227,43 +228,157 @@ curl http://localhost:8003/health | python3 -m json.tool | grep execution_mode
 # 应该看到: "execution_mode": "PAPER"
 ```
 
-#### 3.2 运行风控闸门测试（必须！）
+#### 3.2 运行集成测试（必须！）
 
+**集成测试说明：**
+
+系统提供了多个集成测试命令，已整合到统一的测试工具 `trading_test_tool.py` 中：
+
+##### 3.2.1 风控闸门测试（gates-test 命令）
+
+**用途**：集成测试风控功能（MAX_POSITIONS_BLOCKED、mutex upgrade、cooldown）
+
+**运行方式：**
 ```bash
-# 运行风控功能集成测试
-docker compose exec execution python -m scripts.e2e_stage6_gates_test --reset-db
+# 在 PAPER/BACKTEST 模式下运行（推荐重置数据库）
+docker compose exec execution python -m scripts.trading_test_tool gates-test --reset-db
 
-# 测试项：
-# - MAX_POSITIONS_BLOCKED（最大持仓数限制）
-# - mutex upgrade（同币种同向互斥升级）
-# - cooldown（冷却期功能）
+# 不重置数据库
+docker compose exec execution python -m scripts.trading_test_tool gates-test
+
+# 自定义等待超时时间
+docker compose exec execution python -m scripts.trading_test_tool gates-test --wait 15
 ```
+
+**测试项：**
+- **T1**: MAX_POSITIONS_BLOCKED（最大持仓数限制）- 第4个计划应该被拒绝
+- **T2**: mutex upgrade（同币种同向互斥升级）- 4h 计划应该关闭 1h 持仓并开新仓
+- **T3**: cooldown（冷却期功能）- 止损后重新入场应该被阻止
 
 **预期结果：**
 - ✅ 所有测试通过
-- ✅ 风险事件正确生成
-- ✅ 执行报告正确生成
+- ✅ 风险事件正确生成（MAX_POSITIONS_BLOCKED、COOLDOWN_BLOCKED）
+- ✅ 执行报告正确生成（REJECTED、EXITED、FILLED）
 
-#### 3.3 运行平仓测试
+**何时使用：**
+- **实盘测试前必须运行**，验证风控功能是否正常
+- 验证风控规则是否正确执行
+- 验证风险事件是否正确生成
 
+##### 3.2.2 平仓测试（close-test 命令）
+
+**用途**：测试平仓流程和通知消息（包含 PnL 和连续亏损统计）
+
+**运行方式：**
 ```bash
-# 运行平仓功能测试
-docker compose exec execution python -m scripts.e2e_stage2_close_test
+# 在 PAPER/BACKTEST 模式下运行（使用默认参数）
+docker compose exec execution python -m scripts.trading_test_tool close-test
 
-# 测试项：
-# - 平仓流程
-# - PnL 计算
-# - 连续亏损统计
-# - 通知消息格式
+# 自定义参数
+docker compose exec execution python -m scripts.trading_test_tool close-test \
+  --symbol BTCUSDT \
+  --side BUY \
+  --entry-price 30000 \
+  --sl-price 29000 \
+  --wait-before-close 5 \
+  --wait-after-close 3 \
+  --close-price 30050
 ```
+
+**测试项：**
+- 平仓流程（强制平仓）
+- PnL 计算
+- 连续亏损统计
+- 通知消息格式（如果配置了 Telegram）
 
 **预期结果：**
 - ✅ 持仓成功创建
 - ✅ 平仓成功执行
 - ✅ PnL 正确计算
-- ✅ 通知消息包含正确信息
+- ✅ 通知消息包含正确信息（如果配置了 Telegram）
 
-#### 3.4 测试下单流程（PAPER 模式）
+**何时使用：**
+- 验证平仓流程是否正常
+- 验证通知消息格式是否正确
+- 在实盘测试前验证平仓功能
+
+##### 3.2.3 回放回测（replay 命令）
+
+**用途**：使用历史 bars 回放 `stream:bar_close` 事件，测试完整服务链路
+
+**运行方式：**
+```bash
+# 回放数据库中的最近 2000 根 1h bars
+docker compose exec execution python -m scripts.trading_test_tool replay \
+  --symbol BTCUSDT \
+  --timeframe 60 \
+  --limit 2000
+
+# 指定时间范围回放
+docker compose exec execution python -m scripts.trading_test_tool replay \
+  --symbol BTCUSDT \
+  --timeframe 60 \
+  --start-ms 1700000000000 \
+  --end-ms 1700500000000 \
+  --sleep-ms 5
+
+# 先从 Bybit REST 拉取数据再回放
+docker compose exec execution python -m scripts.trading_test_tool replay \
+  --symbol BTCUSDT \
+  --timeframe 60 \
+  --fetch \
+  --fetch-limit 2000 \
+  --limit 2000
+```
+
+**功能：**
+- 从数据库读取历史 bars
+- 或从 Bybit REST API 拉取 bars 并写入数据库
+- 按时间顺序发布 `bar_close` 事件
+- 生成回测运行记录
+
+**何时使用：**
+- 测试完整服务链路（marketdata → strategy → execution → notifier）
+- 验证策略逻辑是否正确
+- 回测历史数据
+
+##### 3.2.4 限流器自测（ratelimit-test 命令）
+
+**用途**：测试 Bybit API 限流器逻辑（不调用 Bybit，仅测试限流算法）
+
+**运行方式：**
+```bash
+docker compose exec execution python -m scripts.trading_test_tool ratelimit-test
+```
+
+**功能：**
+- 模拟 200 次请求（25% critical, 45% order-query, 30% account-query）
+- 统计等待时间（mean, p50, p90, p99, max）
+- 验证限流器配置
+
+**何时使用：**
+- 开发阶段验证限流器逻辑
+- 调整限流器配置后验证
+
+##### 3.2.5 WebSocket 处理自测（ws-test 命令）
+
+**用途**：测试 WebSocket 消息解析与路由（不连接交易所，使用模拟消息）
+
+**运行方式：**
+```bash
+docker compose exec execution python -m scripts.trading_test_tool ws-test
+```
+
+**功能：**
+- 测试 order、execution、position、wallet 消息处理
+- 验证消息解析不会崩溃
+- 验证路由逻辑正确
+
+**何时使用：**
+- 开发阶段验证 WebSocket 处理逻辑
+- 修改 WebSocket 处理代码后验证
+
+#### 3.3 测试下单流程（PAPER 模式）
 
 ```bash
 # 使用统一测试工具测试下单（PAPER 模式，不会真实下单）
@@ -633,9 +748,9 @@ curl "http://localhost:8000/v1/execution-traces?idempotency_key=${IDEM_KEY}&limi
 - [ ] bar_close 事件正常发布
 - [ ] 策略服务正常消费 bar_close
 - [ ] 信号和交易计划正常生成
-- [ ] 风控闸门测试通过（e2e_stage6_gates_test）
-- [ ] 平仓测试通过（e2e_stage2_close_test）
-- [ ] PAPER 模式下下单流程正常
+- [ ] 风控闸门测试通过（`gates-test` 命令）
+- [ ] 平仓测试通过（`close-test` 命令）
+- [ ] PAPER 模式下下单流程正常（`test` 命令）
 - [ ] 所有 API 端点正常
 
 ### 实盘测试检查清单
@@ -836,8 +951,96 @@ curl "http://localhost:8000/v1/admin/kill-switch" \
 
 ## 📚 相关文档
 
-- `scripts/README_TEST_TOOL.md` - 测试工具使用指南
-- `scripts/E2E_TESTS_README.md` - E2E 集成测试说明
-- `LIVE_TESTING_COMPLETE.md` - 实盘测试详细指南
+- `scripts/trading_test_tool.py` - 统一测试工具（所有测试功能）
+- `LIVE_TRADING_GUIDE.md` - 实盘交易指南
 - `TROUBLESHOOTING.md` - 问题排查指南
+- `SYNC_MECHANISM.md` - 订单和持仓同步机制
 - `CHANGELOG.md` - 变更日志
+
+## 🛠️ 测试工具完整命令列表
+
+所有测试功能已整合到 `trading_test_tool.py`，使用统一命令：
+
+### 基础命令（实盘测试）
+
+```bash
+# 准备检查
+docker compose exec execution python -m scripts.trading_test_tool prepare
+
+# 查看持仓
+docker compose exec execution python -m scripts.trading_test_tool positions
+docker compose exec execution python -m scripts.trading_test_tool positions --detailed
+
+# 清理持仓
+docker compose exec execution python -m scripts.trading_test_tool clean --all
+docker compose exec execution python -m scripts.trading_test_tool clean --all --yes
+docker compose exec execution python -m scripts.trading_test_tool clean <position_id>
+
+# 执行测试下单（⚠️ 会真实下单！）
+docker compose exec execution python -m scripts.trading_test_tool test \
+  --symbol BTCUSDT --side BUY
+docker compose exec execution python -m scripts.trading_test_tool test \
+  --symbol BTCUSDT --side BUY --entry-price 30000 --sl-price 29000
+
+# 查看订单
+docker compose exec execution python -m scripts.trading_test_tool orders
+docker compose exec execution python -m scripts.trading_test_tool orders --idempotency-key idem-xxx
+
+# 诊断下单失败原因
+docker compose exec execution python -m scripts.trading_test_tool diagnose \
+  --symbol BTCUSDT --side BUY
+
+# 同步持仓（检查并修复不一致）
+docker compose exec execution python -m scripts.trading_test_tool sync
+docker compose exec execution python -m scripts.trading_test_tool sync --dry-run
+```
+
+### 集成测试命令（PAPER/BACKTEST 模式）
+
+```bash
+# 平仓测试
+docker compose exec execution python -m scripts.trading_test_tool close-test \
+  --symbol BTCUSDT --side BUY --entry-price 30000 --sl-price 29000
+
+# 风控闸门测试（实盘前必须运行！）
+docker compose exec execution python -m scripts.trading_test_tool gates-test --reset-db
+
+# 回放回测
+docker compose exec execution python -m scripts.trading_test_tool replay \
+  --symbol BTCUSDT --timeframe 60 --limit 2000
+
+# 限流器自测（开发阶段）
+docker compose exec execution python -m scripts.trading_test_tool ratelimit-test
+
+# WebSocket 处理自测（开发阶段）
+docker compose exec execution python -m scripts.trading_test_tool ws-test
+```
+
+### 查看帮助
+
+```bash
+# 查看所有命令
+docker compose exec execution python -m scripts.trading_test_tool --help
+
+# 查看特定命令的帮助
+docker compose exec execution python -m scripts.trading_test_tool test --help
+docker compose exec execution python -m scripts.trading_test_tool gates-test --help
+docker compose exec execution python -m scripts.trading_test_tool replay --help
+```
+
+### 测试工具功能总览
+
+| 命令 | 功能 | 模式要求 | 用途 |
+|------|------|---------|------|
+| `prepare` | 准备检查 | LIVE | 检查配置、服务状态、风险设置 |
+| `positions` | 查看持仓 | 任意 | 查看所有 OPEN 持仓 |
+| `clean` | 清理持仓 | 任意 | 清理无效的 OPEN 持仓 |
+| `test` | 执行测试下单 | LIVE | 执行实盘测试下单（⚠️ 会真实下单） |
+| `orders` | 查看订单 | 任意 | 查看订单列表 |
+| `diagnose` | 诊断下单失败 | LIVE | 诊断下单失败原因 |
+| `sync` | 同步持仓 | LIVE | 同步数据库持仓与交易所持仓 |
+| `close-test` | 平仓测试 | PAPER/BACKTEST | 测试平仓流程和通知消息 |
+| `gates-test` | 风控闸门测试 | PAPER/BACKTEST | 测试风控功能（必须运行） |
+| `replay` | 回放回测 | PAPER/BACKTEST | 使用历史数据回放测试 |
+| `ratelimit-test` | 限流器自测 | 任意 | 测试限流器逻辑（开发阶段） |
+| `ws-test` | WebSocket 自测 | 任意 | 测试 WebSocket 消息处理（开发阶段） |
