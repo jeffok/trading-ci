@@ -174,7 +174,10 @@ def render_execution_report(evt: Dict[str, Any]) -> Tuple[str, str]:
             f"status：{status}",
         ]
         if reason:
-            lines.append(f"原因：{reason}")
+            # 防止 reason 中包含未转义的格式化字符串（如 {group}）
+            # 使用双大括号转义，或者直接替换
+            safe_reason = str(reason).replace("{", "{{").replace("}", "}}")
+            lines.append(f"原因：{safe_reason}")
         text = "\n".join([x for x in lines if x])
 
     # Add traceability footer (kept short)
