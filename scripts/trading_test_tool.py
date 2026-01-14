@@ -1889,6 +1889,539 @@ def cmd_ws_test(args):
     asyncio.run(run_test())
     print_success("WebSocket 处理自测完成！")
 
+# ==================== 数据库完整性检查功能 ====================
+
+def cmd_db_check():
+    """数据库完整性检查命令"""
+    print("=" * 60)
+    print("  数据库完整性检查")
+    print("=" * 60)
+    print()
+    
+    # 检查数据库连接
+    print("[1] 检查数据库连接...")
+    try:
+        with get_conn(settings.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            print_success("数据库连接正常")
+    except Exception as e:
+        print_error(f"数据库连接失败: {e}")
+        sys.exit(1)
+    
+    print()
+    
+    # 检查必要的表
+    print("[2] 检查必要的表...")
+    REQUIRED_TABLES = [
+        "bars", "signals", "trade_plans", "orders", "positions",
+        "execution_reports", "risk_events", "risk_state",
+        "setups", "triggers", "pivots", "indicator_snapshots",
+        "notifications", "execution_traces", "account_snapshots",
+        "cooldowns", "ws_events", "backtest_runs", "backtest_trades",
+        "app_migrations",
+    ]
+    
+    missing_tables = []
+    with get_conn(settings.database_url) as conn:
+        for table in REQUIRED_TABLES:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s)",
+                    (table,),
+                )
+                exists = cur.fetchone()[0]
+                if exists:
+                    print(f"   ✅ 表 {table} 存在")
+                else:
+                    print(f"   ❌ 表 {table} 不存在")
+                    missing_tables.append(table)
+    
+    if missing_tables:
+        print()
+        print_warning(f"缺少 {len(missing_tables)} 个表: {', '.join(missing_tables)}")
+        print_info("建议运行: python -m scripts.trading_test_tool init-db")
+    else:
+        print()
+        print_success("所有必要的表都存在")
+    
+    print()
+    
+    # 检查关键表的结构
+    print("[3] 检查关键表的结构...")
+    KEY_TABLES = {
+        "orders": ["order_id", "idempotency_key", "symbol", "side", "order_type", "qty", "status", "bybit_order_id"],
+        "positions": ["position_id", "idempotency_key", "symbol", "side", "qty_total", "status"],
+        "trade_plans": ["plan_id", "idempotency_key", "symbol", "side", "entry_price", "primary_sl_price"],
+        "execution_reports": ["report_id", "plan_id", "symbol", "type", "status"],
+    }
+    
+    with get_conn(settings.database_url) as conn:
+        for table, columns in KEY_TABLES.items():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s)",
+                    (table,),
+                )
+                if not cur.fetchone()[0]:
+                    print_warning(f"表 {table} 不存在，跳过结构检查")
+                    continue
+            
+            print(f"   检查表 {table}...")
+            missing_cols = []
+            for col in columns:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT EXISTS (SELECT FROM information_schema.columns WHERE table_name = %s AND column_name = %s)",
+                        (table, col),
+                    )
+                    if cur.fetchone()[0]:
+                        print(f"     ✅ 列 {col} 存在")
+                    else:
+                        print(f"     ❌ 列 {col} 不存在")
+                        missing_cols.append(col)
+            
+            if missing_cols:
+                print_warning(f"表 {table} 缺少列: {', '.join(missing_cols)}")
+    
+    print()
+    
+    # 检查迁移版本
+    print("[4] 检查数据库迁移版本...")
+    with get_conn(settings.database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'app_migrations')")
+            if not cur.fetchone()[0]:
+                print_warning("迁移表不存在，可能未运行迁移")
+                print_info("建议运行: python -m scripts.trading_test_tool init-db")
+            else:
+                cur.execute("SELECT filename, applied_at FROM app_migrations ORDER BY applied_at DESC")
+                migrations = cur.fetchall()
+                print_success(f"已应用 {len(migrations)} 个迁移")
+                print()
+                print("   最近的迁移：")
+                for filename, applied_at in migrations[:10]:
+                    print(f"     - {filename} ({applied_at})")
+                
+                # 检查迁移文件数量
+                migrations_dir = project_root / "migrations" / "postgres"
+                migration_files = sorted(migrations_dir.glob("V*.sql"))
+                if len(migration_files) > len(migrations):
+                    print()
+                    print_warning(f"迁移文件数量 ({len(migration_files)}) 大于已应用数量 ({len(migrations)})")
+                    print_info("建议运行: python -m scripts.trading_test_tool init-db")
+    
+    print()
+    
+    # 检查数据统计
+    print("[5] 检查数据统计...")
+    STAT_TABLES = ["bars", "signals", "trade_plans", "orders", "positions", "execution_reports", "risk_events"]
+    
+    with get_conn(settings.database_url) as conn:
+        print("   表记录数：")
+        for table in STAT_TABLES:
+            with conn.cursor() as cur:
+                cur.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s)", (table,))
+                if not cur.fetchone()[0]:
+                    print(f"     {table}: 表不存在")
+                    continue
+                try:
+                    cur.execute(f"SELECT COUNT(*) FROM {table}")
+                    count = cur.fetchone()[0]
+                    print(f"     {table}: {count} 条记录")
+                except Exception:
+                    print(f"     {table}: 查询失败")
+    
+    print()
+    
+    # 检查 OPEN 持仓
+    print("[6] 检查 OPEN 持仓...")
+    with get_conn(settings.database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'positions')")
+            if cur.fetchone()[0]:
+                cur.execute("SELECT COUNT(*) FROM positions WHERE status='OPEN'")
+                open_count = cur.fetchone()[0]
+                
+                if open_count == 0:
+                    print_success("没有 OPEN 持仓")
+                else:
+                    print_warning(f"有 {open_count} 个 OPEN 持仓")
+                    cur.execute(
+                        "SELECT position_id, symbol, side, qty_total, created_at FROM positions WHERE status='OPEN' ORDER BY created_at DESC LIMIT 5"
+                    )
+                    print("   持仓列表：")
+                    for row in cur.fetchall():
+                        print(f"     - {row[1]} {row[2]} qty={row[3]} (id={row[0][:20]}...)")
+            else:
+                print_warning("positions 表不存在")
+    
+    print()
+    print("=" * 60)
+    print("  检查总结")
+    print("=" * 60)
+    print()
+    
+    if missing_tables:
+        print_error("数据库不完整：缺少以下表")
+        for table in missing_tables:
+            print(f"   - {table}")
+        print()
+        print_info("修复建议：")
+        print("   运行数据库迁移：")
+        print("     python -m scripts.trading_test_tool init-db")
+        print("   或在 Docker 容器中：")
+        print("     docker compose exec execution python -m scripts.trading_test_tool init-db")
+        sys.exit(1)
+    else:
+        print_success("数据库完整性检查通过")
+        print()
+        print("所有必要的表都存在，数据库结构完整。")
+
+# ==================== 离线回测功能 ====================
+
+def cmd_backtest(args):
+    """离线回测命令"""
+    print("=" * 60)
+    print("  离线回测")
+    print("=" * 60)
+    print()
+    
+    try:
+        import hashlib
+        from services.strategy.repo import get_bars
+        from libs.backtest.engine import backtest
+        from libs.backtest.report import summarize, to_jsonable
+        from libs.backtest.repo import insert_backtest_run, insert_backtest_trade
+    except ImportError as e:
+        print_error(f"导入失败: {e}")
+        sys.exit(1)
+    
+    symbol = args.symbol.upper()
+    tf = args.timeframe
+    
+    print_info(f"Symbol: {symbol}, Timeframe: {tf}, Limit: {args.limit}")
+    
+    bars = get_bars(settings.database_url, symbol=symbol, timeframe=tf, limit=args.limit)
+    if len(bars) < 200:
+        print_error(f"bars 数量太少: {len(bars)}，至少需要 200 根")
+        sys.exit(1)
+    
+    print_info(f"获取到 {len(bars)} 根 K 线")
+    
+    results = backtest(
+        symbol=symbol,
+        timeframe=tf,
+        bars=bars,
+        min_confirmations=settings.min_confirmations,
+        trail_mode=args.trail,
+        atr_period=args.atr_period,
+        atr_mult=args.atr_mult,
+    )
+    
+    summary = summarize(results)
+    print()
+    print("回测结果汇总：")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    
+    # 保存报告
+    Path("reports").mkdir(exist_ok=True)
+    ts = int(time.time())
+    path = Path("reports") / f"backtest_{symbol}_{tf}_{ts}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"summary": summary, "results": to_jsonable(results)}, f, ensure_ascii=False, indent=2)
+    print()
+    print_success(f"报告已保存: {path}")
+    
+    # 可选写入数据库
+    if args.write_db:
+        run_id = args.run_id.strip() or hashlib.sha256(f"{symbol}|{tf}|{ts}".encode("utf-8")).hexdigest()
+        start_ms = int(bars[0].get("open_time_ms") or bars[0].get("ts_ms") or 0)
+        end_ms = int(bars[-1].get("close_time_ms") or bars[-1].get("ts_ms") or 0)
+        params = {
+            "trail": args.trail,
+            "atr_period": args.atr_period,
+            "atr_mult": args.atr_mult,
+            "limit": args.limit,
+        }
+        insert_backtest_run(
+            settings.database_url,
+            run_id=run_id,
+            symbol=symbol,
+            timeframe=tf,
+            start_time_ms=start_ms,
+            end_time_ms=end_ms,
+            params=params,
+            summary=summary,
+        )
+        # 逐笔交易落库
+        js = to_jsonable(results)
+        for idx, tr in enumerate(js):
+            trade_id = hashlib.sha256(f"{run_id}|{idx}".encode("utf-8")).hexdigest()
+            entry_i = int(tr.get("entry_i", 0))
+            exit_i = int(tr.get("exit_i", 0))
+            entry_time_ms = int((bars[entry_i].get("close_time_ms") if entry_i < len(bars) else 0) or 0)
+            exit_time_ms = int((bars[exit_i].get("close_time_ms") if exit_i < len(bars) else 0) or 0)
+            side = tr.get("side")
+            side2 = "LONG" if side == "BUY" else ("SHORT" if side == "SELL" else str(side))
+            insert_backtest_trade(
+                settings.database_url,
+                trade_id=trade_id,
+                run_id=run_id,
+                symbol=symbol,
+                timeframe=tf,
+                entry_time_ms=entry_time_ms,
+                exit_time_ms=exit_time_ms,
+                side=side2,
+                entry_price=float(tr.get("entry")),
+                exit_price=float(tr.get("legs", [])[-1].get("price")) if tr.get("legs") else float(tr.get("entry")),
+                pnl_r=float(tr.get("pnl_r")),
+                reason=str(tr.get("reason")),
+                legs=tr.get("legs", []),
+            )
+        print_success(f"回测结果已写入数据库: run_id={run_id}")
+
+# ==================== 回放+报告功能 ====================
+
+def cmd_replay_report(args):
+    """回放+等待+报告生成命令"""
+    print("=" * 60)
+    print("  回放回测 + 报告生成")
+    print("=" * 60)
+    print()
+    
+    try:
+        import httpx
+        from libs.mq.redis_streams import RedisStreamsClient
+    except ImportError as e:
+        print_error(f"导入失败: {e}")
+        sys.exit(1)
+    
+    STREAMS = [
+        "stream:bar_close",
+        "stream:signal",
+        "stream:trade_plan",
+        "stream:execution_report",
+        "stream:risk_event",
+        "stream:dlq",
+    ]
+    
+    # 确保 streams/groups
+    c = RedisStreamsClient(settings.redis_url)
+    for s in STREAMS:
+        c.ensure_group(s, settings.redis_stream_group)
+    
+    # 执行回放（复用 replay 命令的逻辑）
+    print_info("执行回放...")
+    replay_args = argparse.Namespace(
+        symbol=args.symbol,
+        timeframe=args.timeframe,
+        limit=args.limit,
+        run_id=args.run_id,
+        start_ms=None,
+        end_ms=None,
+        fetch=False,
+        fetch_limit=0,
+        sleep_ms=0,
+    )
+    cmd_replay(replay_args)
+    
+    # 获取 run_id（从回放命令的输出或参数）
+    run_id = args.run_id.strip() if args.run_id else ""
+    if not run_id:
+        # 从 Redis 最末一条 bar_close 读取 ext.run_id
+        try:
+            last = c.r.xrevrange("stream:bar_close", count=1)
+            if last:
+                _mid, fields = last[0]
+                evt = json.loads(fields.get("json")) if "json" in fields else fields
+                run_id = ((evt.get("payload") or {}).get("ext") or {}).get("run_id") or ""
+        except Exception:
+            pass
+    
+    if not run_id:
+        print_error("无法获取 run_id：建议显式传 --run-id")
+        sys.exit(1)
+    
+    print_info(f"Run ID: {run_id}")
+    print()
+    
+    # 等待链路处理完成
+    print_info("等待链路处理完成...")
+    timeout_sec = args.timeout_sec
+    stable_sec = 5
+    
+    def _db_count_positions(run_id: str, status: str) -> int:
+        with get_conn(settings.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(1) FROM positions WHERE (meta->>'run_id')=%s AND status=%s", (run_id, status))
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+    
+    start = time.time()
+    stable_start: Optional[float] = None
+    
+    while True:
+        pend = {s: c.pending_count(s, settings.redis_stream_group) for s in STREAMS}
+        open_pos = _db_count_positions(run_id, "OPEN")
+        
+        all_zero = all(int(v) == 0 for v in pend.values())
+        done = all_zero and open_pos == 0
+        
+        if done:
+            if stable_start is None:
+                stable_start = time.time()
+            if (time.time() - stable_start) >= stable_sec:
+                wait_result = {"pending": pend, "positions_open": open_pos, "wait_sec": int(time.time() - start)}
+                break
+        else:
+            stable_start = None
+        
+        if (time.time() - start) > timeout_sec:
+            wait_result = {"pending": pend, "positions_open": open_pos, "wait_sec": int(time.time() - start), "timeout": True}
+            break
+        
+        time.sleep(1.0)
+    
+    print_success(f"等待完成，耗时 {wait_result.get('wait_sec')} 秒")
+    print()
+    
+    # 统计
+    def _db_count_jsonb_run_id(table: str, run_id: str) -> int:
+        with get_conn(settings.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(1) FROM {table} WHERE (payload->'payload'->'ext'->>'run_id') = %s", (run_id,))
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+    
+    def _db_count_orders_run_id(run_id: str) -> int:
+        with get_conn(settings.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(1) FROM orders WHERE (payload->'ext'->>'run_id')=%s", (run_id,))
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+    
+    def _db_list_backtest_trades(run_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+        with get_conn(settings.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT trade_id, run_id, symbol, timeframe, entry_time_ms, exit_time_ms, side, entry_price, exit_price, pnl_r, reason, legs "
+                    "FROM backtest_trades WHERE run_id=%s ORDER BY entry_time_ms ASC LIMIT %s",
+                    (run_id, limit),
+                )
+                cols = [d.name for d in cur.description]
+                out = []
+                for row in cur.fetchall():
+                    out.append({cols[i]: row[i] for i in range(len(cols))})
+                return out
+    
+    stats = {
+        "signals": _db_count_jsonb_run_id("signals", run_id),
+        "trade_plans": _db_count_jsonb_run_id("trade_plans", run_id),
+        "orders": _db_count_orders_run_id(run_id),
+        "execution_reports": _db_count_jsonb_run_id("execution_reports", run_id),
+        "positions_open": _db_count_positions(run_id, "OPEN"),
+        "positions_closed": _db_count_positions(run_id, "CLOSED"),
+        "backtest_trades": len(_db_list_backtest_trades(run_id, limit=100000)),
+    }
+    trades = _db_list_backtest_trades(run_id, limit=200)
+    
+    # 生成报告
+    Path("reports").mkdir(exist_ok=True)
+    out_json = Path("reports") / f"replay_{run_id}.json"
+    out_md = Path("reports") / f"replay_{run_id}.md"
+    
+    blob = {"run_id": run_id, "stats": stats, "wait": wait_result, "trades": trades}
+    
+    # API compare（可选）
+    api_compare = None
+    if args.api_url.strip():
+        try:
+            api_compare = httpx.get(
+                f"{args.api_url.rstrip('/')}/v1/backtest-compare",
+                params={"run_id": run_id, "limit_trades": 50},
+                timeout=10.0,
+            ).json()
+            blob["api_compare"] = api_compare
+        except Exception:
+            pass
+    
+    # 生成 Markdown 报告
+    lines: List[str] = []
+    lines.append(f"# trading-ci 回放报告")
+    lines.append("")
+    lines.append(f"- run_id: `{run_id}`")
+    lines.append(f"- symbol: `{args.symbol}`  timeframe: `{args.timeframe}`  limit: `{args.limit}`")
+    lines.append(f"- mode(EXECUTION_MODE): `{settings.execution_mode}`")
+    lines.append("")
+    lines.append("## 等待链路空闲结果")
+    lines.append(f"- wait_sec: {wait_result.get('wait_sec')}  timeout: {bool(wait_result.get('timeout', False))}")
+    lines.append(f"- positions_open: {wait_result.get('positions_open')} ")
+    lines.append("- pending:")
+    for k, v in (wait_result.get("pending") or {}).items():
+        lines.append(f"  - {k}: {v}")
+    lines.append("")
+    lines.append("## 产物统计（按 run_id 过滤）")
+    for k, v in stats.items():
+        lines.append(f"- {k}: {v}")
+    lines.append("")
+    lines.append("## backtest_trades（前 50 条）")
+    if not trades:
+        lines.append("- （空）")
+    else:
+        lines.append("| idx | side | pnl_r | entry_time_ms | exit_time_ms | reason | idempotency_key | trade_id |")
+        lines.append("|---:|---|---:|---:|---:|---|---|---|")
+        for i, tr in enumerate(trades[:50], start=1):
+            legs = tr.get("legs") or []
+            idem = ""
+            if isinstance(legs, list) and legs:
+                idem = str(legs[0].get("idempotency_key", "")) if isinstance(legs[0], dict) else ""
+            lines.append(f"| {i} | {tr.get('side')} | {tr.get('pnl_r')} | {tr.get('entry_time_ms')} | {tr.get('exit_time_ms')} | {tr.get('reason')} | {idem} | {tr.get('trade_id')} |")
+    
+    if api_compare is not None:
+        lines.append("")
+        lines.append("## API /v1/backtest-compare 返回（可选）")
+        lines.append("```json")
+        lines.append(json.dumps(api_compare, ensure_ascii=False, indent=2))
+        lines.append("```")
+    
+    out_json.write_text(json.dumps(blob, ensure_ascii=False, indent=2), encoding="utf-8")
+    out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    
+    print_success(f"报告已生成: {out_md}, {out_json}")
+
+# ==================== 基础设施初始化功能 ====================
+
+def cmd_init_db():
+    """数据库迁移初始化命令"""
+    print("=" * 60)
+    print("  数据库迁移初始化")
+    print("=" * 60)
+    print()
+    
+    try:
+        from scripts.init_db import main as init_db_main
+    except ImportError as e:
+        print_error(f"导入失败: {e}")
+        sys.exit(1)
+    
+    init_db_main()
+
+def cmd_init_streams():
+    """Redis Streams 初始化命令"""
+    print("=" * 60)
+    print("  Redis Streams 初始化")
+    print("=" * 60)
+    print()
+    
+    try:
+        from scripts.init_streams import main as init_streams_main
+    except ImportError as e:
+        print_error(f"导入失败: {e}")
+        sys.exit(1)
+    
+    init_streams_main()
+
 # ==================== 主函数 ====================
 
 def main():
@@ -1956,6 +2489,23 @@ def main():
 
   # WebSocket 处理自测
   python -m scripts.trading_test_tool ws-test
+
+  # 数据库完整性检查
+  python -m scripts.trading_test_tool db-check
+
+  # 离线回测
+  python -m scripts.trading_test_tool backtest \\
+    --symbol BTCUSDT --timeframe 1h --limit 5000 --trail ATR
+
+  # 回放+报告生成
+  python -m scripts.trading_test_tool replay-report \\
+    --symbol BTCUSDT --timeframe 60 --limit 2000
+
+  # 数据库迁移初始化
+  python -m scripts.trading_test_tool init-db
+
+  # Redis Streams 初始化
+  python -m scripts.trading_test_tool init-streams
         """
     )
     
@@ -2034,6 +2584,35 @@ def main():
     # ws-test 命令
     subparsers.add_parser('ws-test', help='WebSocket 处理自测（测试消息解析与路由）')
     
+    # db-check 命令
+    subparsers.add_parser('db-check', help='数据库完整性检查')
+    
+    # backtest 命令
+    backtest_parser = subparsers.add_parser('backtest', help='离线回测（读取 bars，模拟执行）')
+    backtest_parser.add_argument('--symbol', required=True, help='交易对，如 BTCUSDT')
+    backtest_parser.add_argument('--timeframe', required=True, help='时间框架，如 60/240/D')
+    backtest_parser.add_argument('--limit', type=int, default=5000, help='K 线数量限制')
+    backtest_parser.add_argument('--trail', choices=['ATR', 'PIVOT'], default='ATR', help='追踪止损模式')
+    backtest_parser.add_argument('--atr-period', type=int, default=14, dest='atr_period', help='ATR 周期')
+    backtest_parser.add_argument('--atr-mult', type=float, default=2.0, dest='atr_mult', help='ATR 倍数')
+    backtest_parser.add_argument('--write-db', action='store_true', help='将回测结果写入数据库')
+    backtest_parser.add_argument('--run-id', default='', help='可选：指定 run_id')
+    
+    # replay-report 命令
+    replay_report_parser = subparsers.add_parser('replay-report', help='回放回测 + 等待 + 报告生成')
+    replay_report_parser.add_argument('--symbol', required=True, help='交易对，如 BTCUSDT')
+    replay_report_parser.add_argument('--timeframe', required=True, help='时间框架，如 60/240/D')
+    replay_report_parser.add_argument('--limit', type=int, default=2000, help='K 线数量限制')
+    replay_report_parser.add_argument('--run-id', default='', help='可选：指定 run_id')
+    replay_report_parser.add_argument('--timeout-sec', type=int, default=300, help='等待超时时间（秒）')
+    replay_report_parser.add_argument('--api-url', default='', help='可选：API 服务地址，用于获取 compare 信息')
+    
+    # init-db 命令
+    subparsers.add_parser('init-db', help='数据库迁移初始化（幂等）')
+    
+    # init-streams 命令
+    subparsers.add_parser('init-streams', help='Redis Streams 初始化（幂等）')
+    
     args = parser.parse_args()
     
     if not args.command:
@@ -2065,6 +2644,16 @@ def main():
         cmd_ratelimit_test(args)
     elif args.command == 'ws-test':
         cmd_ws_test(args)
+    elif args.command == 'db-check':
+        cmd_db_check()
+    elif args.command == 'backtest':
+        cmd_backtest(args)
+    elif args.command == 'replay-report':
+        cmd_replay_report(args)
+    elif args.command == 'init-db':
+        cmd_init_db()
+    elif args.command == 'init-streams':
+        cmd_init_streams()
     else:
         parser.print_help()
         sys.exit(1)

@@ -20,11 +20,14 @@
 # 查看当前持仓
 docker compose exec execution python -m scripts.trading_test_tool positions
 
-# 清理无效持仓（如果存在）
-docker compose exec execution python -m scripts.trading_test_tool clean --all --yes
+# 同步数据库持仓与交易所持仓（自动检测并修复无效持仓）
+docker compose exec execution python -m scripts.trading_test_tool sync
+
+# 或者先查看将要执行的操作（dry-run 模式）
+docker compose exec execution python -m scripts.trading_test_tool sync --dry-run
 
 # 验证清理结果
-curl "http://localhost:8000/v1/positions?limit=10" | python3 -m json.tool
+docker compose exec execution python -m scripts.trading_test_tool positions
 ```
 
 ### 2. 配置环境变量
@@ -398,9 +401,8 @@ curl "http://localhost:8000/v1/risk-events?trade_date=$(date +%Y-%m-%d)&limit=20
 
 ## 📚 相关文档
 
-- [TESTING_GUIDE.md](./TESTING_GUIDE.md) - 完整测试指南
-- [STALE_POSITIONS_FIX.md](./STALE_POSITIONS_FIX.md) - 无效持仓修复
-- [POSITION_MUTEX_EXPLAINED.md](./POSITION_MUTEX_EXPLAINED.md) - 持仓互斥说明
+- [COMPLETE_TESTING_GUIDE.md](./COMPLETE_TESTING_GUIDE.md) - 完整测试指南
+- [SYNC_MECHANISM.md](./SYNC_MECHANISM.md) - 订单与持仓同步机制说明
 - [.env.example](./.env.example) - 环境变量配置示例
 
 ---

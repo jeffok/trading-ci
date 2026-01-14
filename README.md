@@ -92,7 +92,7 @@ repo/
 ## 6. Phase 5：离线回测 + 信号评分（不改变策略）
 ### 6.1 回测（读取 Postgres bars）
 ```bash
-python3 scripts/backtest.py --symbol BTCUSDT --timeframe 1h --limit 5000 --trail ATR
+docker compose exec execution python -m scripts.trading_test_tool backtest --symbol BTCUSDT --timeframe 1h --limit 5000 --trail ATR
 ```
 
 ### 6.2 信号评分（仅用于复盘）
@@ -164,8 +164,8 @@ python3 scripts/backtest.py --symbol BTCUSDT --timeframe 1h --limit 5000 --trail
 
 本项目有两条“回测路径”：
 
-1) **ENGINE 回测（脚本级）**：`scripts/backtest.py` 直接在本地计算信号/交易结果，并可写入 `backtest_runs/backtest_trades`（Stage 5）。
-2) **REPLAY 回放回测（服务级）**：`scripts/replay_backtest.py` 逐根发布 `stream:bar_close`，让 **strategy / execution / notifier / api** 跑完整链路（Stage 6）。
+1) **ENGINE 回测（脚本级）**：`trading_test_tool backtest` 直接在本地计算信号/交易结果，并可写入 `backtest_runs/backtest_trades`（Stage 5）。
+2) **REPLAY 回放回测（服务级）**：`trading_test_tool replay` 逐根发布 `stream:bar_close`，让 **strategy / execution / notifier / api** 跑完整链路（Stage 6）。
    - 适合联调、排障、验证“线上链路一致性”
    - 需要 `EXECUTION_MODE=paper/backtest` 开启执行层撮合模拟（TP/SL/Runner）
 
@@ -179,7 +179,7 @@ python3 scripts/backtest.py --symbol BTCUSDT --timeframe 1h --limit 5000 --trail
 
 2) 回放最近 N 根 bars：
 ```bash
-python scripts/replay_backtest.py --symbol BTCUSDT --timeframe 60 --limit 2000
+docker compose exec execution python -m scripts.trading_test_tool replay --symbol BTCUSDT --timeframe 60 --limit 2000
 ```
 
 3) 用 API 检查闭环进度（run_id 来自脚本输出）：
@@ -198,8 +198,8 @@ curl "http://localhost:8000/v1/backtest-compare?run_id=<RUN_ID>&limit_trades=50"
 
 ## Stage 7：一键回放 + 等待链路空闲 + 自动生成回测报告（CI/回放收口）
 新增能力：
-- 脚本：`scripts/run_replay_and_report.py`
-  - 自动调用 `replay_backtest.py` 发布 bar_close（含 run_id）
+- 脚本：`trading_test_tool replay-report`
+  - 自动调用 `replay` 命令发布 bar_close（含 run_id）
   - 等待关键 streams 的 pending 清零 + positions_open(run_id)=0
   - 直接查 Postgres 汇总统计并生成报告：
     - `reports/replay_<run_id>.md`

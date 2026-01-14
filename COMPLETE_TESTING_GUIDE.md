@@ -38,13 +38,13 @@ docker compose ps
 
 ```bash
 # 初始化数据库（如果还没初始化）
-docker compose exec execution python -m scripts.init_db
+docker compose exec execution python -m scripts.trading_test_tool init-db
 
 # 初始化 Redis Streams（如果还没初始化）
-docker compose exec execution python -m scripts.init_streams
+docker compose exec execution python -m scripts.trading_test_tool init-streams
 
 # 验证数据库完整性
-docker compose exec execution python -m scripts.check_db_integrity
+docker compose exec execution python -m scripts.trading_test_tool db-check
 ```
 
 #### 1.3 检查数据库连接
@@ -126,7 +126,7 @@ done
 
 ```bash
 # 运行数据库完整性检查
-docker compose exec execution python -m scripts.check_db_integrity
+docker compose exec execution python -m scripts.trading_test_tool db-check
 ```
 
 **检查项：**
