@@ -504,13 +504,19 @@ def check_execution_result(
     reports = r.xrevrange("stream:execution_report", max="+", min="-", count=50)
     related_reports = []
     for msg_id, fields in reports:
-        if "json" in fields:
+        # 兼容两种字段格式：json（旧格式）和 data（新格式）
+        raw_data = fields.get("json") or fields.get("data")
+        if raw_data:
             try:
-                evt = json.loads(fields["json"])
+                evt = json.loads(raw_data)
                 payload = evt.get("payload", {})
+                # 检查 plan_id 或 idempotency_key（可能在 payload 或 ext 中）
+                ext = payload.get("ext", {}) or {}
+                payload_idem = payload.get("idempotency_key") or ext.get("idempotency_key")
+                payload_plan_id = payload.get("plan_id")
                 if (
-                    payload.get("plan_id") == plan_id
-                    or payload.get("idempotency_key") == idempotency_key
+                    payload_plan_id == plan_id
+                    or payload_idem == idempotency_key
                 ):
                     related_reports.append(evt)
             except Exception:
@@ -520,13 +526,25 @@ def check_execution_result(
         print(f"   找到 {len(related_reports)} 个相关执行报告:")
         for i, rep in enumerate(related_reports[:5], 1):
             payload = rep.get("payload", {})
-            print(f"   {i}. {payload.get('typ')} - {payload.get('status')} - {payload.get('symbol')}")
-            if payload.get("detail"):
-                detail = payload.get("detail", {})
-                if isinstance(detail, dict):
-                    reason = detail.get("reason", "")
-                    if reason:
-                        print(f"      原因: {reason}")
+            status = payload.get("status", "")
+            symbol = payload.get("symbol", "")
+            print(f"   {i}. 状态: {status}, 交易对: {symbol}")
+            
+            # 显示错误信息或原因
+            detail = payload.get("detail", {})
+            if isinstance(detail, dict):
+                reason = detail.get("reason") or detail.get("error")
+                if reason:
+                    print(f"      原因: {reason}")
+            
+            # 显示 ext 中的信息
+            ext = payload.get("ext", {})
+            if isinstance(ext, dict):
+                ext_detail = ext.get("detail", {})
+                if isinstance(ext_detail, dict):
+                    ext_reason = ext_detail.get("reason") or ext_detail.get("error")
+                    if ext_reason:
+                        print(f"      详细信息: {ext_reason}")
     else:
         print("   ⚠️  未找到相关执行报告")
     
@@ -535,14 +553,17 @@ def check_execution_result(
     risk_events = r.xrevrange("stream:risk_event", max="+", min="-", count=50)
     related_risks = []
     for msg_id, fields in risk_events:
-        if "json" in fields:
+        # 兼容两种字段格式：json（旧格式）和 data（新格式）
+        raw_data = fields.get("json") or fields.get("data")
+        if raw_data:
             try:
-                evt = json.loads(fields["json"])
+                evt = json.loads(raw_data)
                 payload = evt.get("payload", {})
                 detail = payload.get("detail", {}) if isinstance(payload.get("detail"), dict) else {}
                 if (
                     detail.get("existing_idempotency_key") == idempotency_key
                     or detail.get("incoming_idempotency_key") == idempotency_key
+                    or detail.get("idempotency_key") == idempotency_key
                 ):
                     related_risks.append(evt)
             except Exception:
