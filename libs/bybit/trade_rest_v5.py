@@ -244,6 +244,10 @@ class TradeRestV5Client:
         params = params or {}
         body = body or {}
 
+        # 定义 group 和 symbol（在内部函数 _once 中使用）
+        group = self._endpoint_group(path)
+        symbol = self._extract_symbol(params, body)
+
         def _once() -> Dict[str, Any]:
             query = urllib.parse.urlencode(params)
             json_body = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
