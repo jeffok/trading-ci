@@ -27,24 +27,34 @@ print_warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
-# 从 .env 文件读取 DATABASE_URL
+# 从环境变量或 .env 文件读取 DATABASE_URL
 DB_URL=""
-if [ -f ".env" ]; then
-    DB_URL=$(grep "^DATABASE_URL=" .env | cut -d'=' -f2- | sed "s/^['\"]//;s/['\"]$//" | head -1)
-fi
 
-if [ -z "$DB_URL" ]; then
-    DB_URL="${DATABASE_URL:-}"
+# 优先使用环境变量（容器内运行时）
+if [ -n "${DATABASE_URL:-}" ]; then
+    DB_URL="$DATABASE_URL"
+elif [ -f ".env" ]; then
+    # 从 .env 文件读取
+    DB_URL=$(grep "^DATABASE_URL=" .env | cut -d'=' -f2- | sed "s/^['\"]//;s/['\"]$//" | head -1)
 fi
 
 if [ -z "$DB_URL" ]; then
     print_error "无法获取数据库连接信息"
     echo "请设置 DATABASE_URL 环境变量或在 .env 文件中配置"
+    echo ""
+    echo "在容器内运行时，DATABASE_URL 应该已经设置"
+    echo "检查方法："
+    echo "  docker compose exec execution printenv DATABASE_URL"
     exit 1
 fi
 
+# 检测是否在容器内运行
 USE_DOCKER=false
-if command -v psql > /dev/null 2>&1; then
+if [ -f "/.dockerenv" ] || [ -n "${DOCKER_CONTAINER:-}" ]; then
+    # 在容器内，直接使用 psql
+    USE_DOCKER=false
+elif command -v psql > /dev/null 2>&1; then
+    # 本地有 psql，测试是否支持 SCRAM
     if ! psql "$DB_URL" -c "SELECT 1;" > /dev/null 2>&1; then
         ERROR_MSG=$(psql "$DB_URL" -c "SELECT 1;" 2>&1 || true)
         if echo "$ERROR_MSG" | grep -q "SCRAM authentication requires libpq version 10"; then
@@ -52,6 +62,7 @@ if command -v psql > /dev/null 2>&1; then
         fi
     fi
 else
+    # 本地没有 psql，使用 Docker
     USE_DOCKER=true
 fi
 
@@ -66,8 +77,10 @@ echo ""
 run_sql() {
     local sql="$1"
     if [ "$USE_DOCKER" = true ]; then
-        docker compose exec -T execution psql "$DB_URL" -c "$sql" 2>&1
+        # 从容器环境变量读取 DATABASE_URL
+        docker compose exec -T execution bash -c "psql \"\$DATABASE_URL\" -c \"$sql\"" 2>&1
     else
+        # 直接使用 DB_URL（容器内或本地）
         psql "$DB_URL" -c "$sql" 2>&1
     fi
 }
