@@ -29,27 +29,117 @@ if [ -z "$DB_URL" ]; then
 fi
 
 # 检测是否在容器内运行
-USE_DOCKER=false
+IN_CONTAINER=false
 if [ -f "/.dockerenv" ] || [ -n "${DOCKER_CONTAINER:-}" ]; then
-    USE_DOCKER=false
-elif command -v psql > /dev/null 2>&1; then
-    if ! psql "$DB_URL" -c "SELECT 1;" > /dev/null 2>&1; then
-        ERROR_MSG=$(psql "$DB_URL" -c "SELECT 1;" 2>&1 || true)
-        if echo "$ERROR_MSG" | grep -q "SCRAM authentication requires libpq version 10"; then
-            USE_DOCKER=true
-        fi
-    fi
-else
-    USE_DOCKER=true
+    IN_CONTAINER=true
+fi
+
+# 检测 psql 是否可用
+HAS_PSQL=false
+if command -v psql > /dev/null 2>&1; then
+    HAS_PSQL=true
 fi
 
 # 执行 SQL
 run_sql() {
     local sql="$1"
-    if [ "$USE_DOCKER" = true ]; then
-        docker compose exec -T execution bash -c "psql \"\$DATABASE_URL\" -c \"$sql\"" 2>&1
+    
+    if [ "$IN_CONTAINER" = true ]; then
+        # 在容器内，使用 Python 执行 SQL
+        python3 -c "
+import os
+import sys
+sys.path.insert(0, '/app')
+from libs.db.pg import get_conn
+import json
+
+db_url = os.environ.get('DATABASE_URL', '')
+if not db_url:
+    print('ERROR: DATABASE_URL not set', file=sys.stderr)
+    sys.exit(1)
+
+sql = '''$sql'''
+
+try:
+    with get_conn(db_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            if sql.strip().upper().startswith('SELECT'):
+                cols = [desc[0] for desc in cur.description]
+                rows = cur.fetchall()
+                # 打印表头
+                print(' | '.join(cols))
+                print('-' * 80)
+                # 打印数据
+                for row in rows:
+                    print(' | '.join(str(v) if v is not None else 'NULL' for v in row))
+            else:
+                conn.commit()
+                print('OK')
+except Exception as e:
+    print(f'ERROR: {e}', file=sys.stderr)
+    sys.exit(1)
+" 2>&1
+    elif [ "$HAS_PSQL" = true ]; then
+        # 本地有 psql，先测试连接
+        if psql "$DB_URL" -c "SELECT 1;" > /dev/null 2>&1; then
+            psql "$DB_URL" -c "$sql" 2>&1
+        else
+            ERROR_MSG=$(psql "$DB_URL" -c "SELECT 1;" 2>&1 || true)
+            if echo "$ERROR_MSG" | grep -q "SCRAM authentication requires libpq version 10"; then
+                # 本地 psql 不支持 SCRAM，使用 Docker
+                docker compose exec -T execution bash -c "python3 -c \"
+import os
+import sys
+sys.path.insert(0, '/app')
+from libs.db.pg import get_conn
+
+db_url = os.environ.get('DATABASE_URL', '')
+sql = '''$sql'''
+
+with get_conn(db_url) as conn:
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        if sql.strip().upper().startswith('SELECT'):
+            cols = [desc[0] for desc in cur.description]
+            rows = cur.fetchall()
+            print(' | '.join(cols))
+            print('-' * 80)
+            for row in rows:
+                print(' | '.join(str(v) if v is not None else 'NULL' for v in row))
+        else:
+            conn.commit()
+            print('OK')
+\"" 2>&1
+            else
+                psql "$DB_URL" -c "$sql" 2>&1
+            fi
+        fi
     else
-        psql "$DB_URL" -c "$sql" 2>&1
+        # 本地没有 psql，使用 Docker
+        docker compose exec -T execution bash -c "python3 -c \"
+import os
+import sys
+sys.path.insert(0, '/app')
+from libs.db.pg import get_conn
+
+db_url = os.environ.get('DATABASE_URL', '')
+sql = '''$sql'''
+
+with get_conn(db_url) as conn:
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        if sql.strip().upper().startswith('SELECT'):
+            cols = [desc[0] for desc in cur.description]
+            rows = cur.fetchall()
+            print(' | '.join(cols))
+            print('-' * 80)
+            for row in rows:
+                print(' | '.join(str(v) if v is not None else 'NULL' for v in row))
+        else:
+            conn.commit()
+            print('OK')
+\"" 2>&1
     fi
 }
 
