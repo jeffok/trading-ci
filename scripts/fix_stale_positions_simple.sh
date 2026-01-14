@@ -27,11 +27,26 @@ print_warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
-# 从环境变量或参数获取数据库连接信息
-DB_HOST="${DB_HOST:-localhost}"
-DB_PORT="${DB_PORT:-5432}"
-DB_NAME="${DB_NAME:-trading-ci}"
-DB_USER="${DB_USER:-postgres}"
+# 从 .env 文件或环境变量获取数据库连接信息
+DB_URL=""
+if [ -f ".env" ]; then
+    # 从 .env 文件中提取 DATABASE_URL（处理可能的引号）
+    DB_URL=$(grep "^DATABASE_URL=" .env | cut -d'=' -f2- | sed "s/^['\"]//;s/['\"]$//" | head -1)
+fi
+
+# 如果 .env 中没有，尝试环境变量
+if [ -z "$DB_URL" ]; then
+    DB_URL="${DATABASE_URL:-}"
+fi
+
+# 如果还是没有，尝试从单独的环境变量构建
+if [ -z "$DB_URL" ]; then
+    DB_HOST="${DB_HOST:-localhost}"
+    DB_PORT="${DB_PORT:-5432}"
+    DB_NAME="${DB_NAME:-trading-ci}"
+    DB_USER="${DB_USER:-postgres}"
+    DB_URL="postgresql://${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+fi
 
 # 解析参数
 DRY_RUN=false
@@ -62,6 +77,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --help, -h     显示帮助信息"
             echo ""
             echo "环境变量:"
+            echo "  DATABASE_URL    数据库连接 URL（优先使用）"
+            echo "  或单独设置:"
             echo "  DB_HOST        数据库主机（默认: localhost）"
             echo "  DB_PORT        数据库端口（默认: 5432）"
             echo "  DB_NAME        数据库名称（默认: trading-ci）"
@@ -92,10 +109,7 @@ if ! command -v psql > /dev/null 2>&1; then
     exit 1
 fi
 
-# 构建连接字符串
-DB_URL="postgresql://${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
-
-print_info "数据库连接: ${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+print_info "数据库连接: ${DB_URL%%@*}@***"
 echo ""
 
 # 查询 OPEN 持仓

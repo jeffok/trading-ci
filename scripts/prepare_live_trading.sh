@@ -87,15 +87,46 @@ echo ""
 # 检查数据库连接
 print_info "检查数据库连接..."
 if command -v psql > /dev/null 2>&1; then
-    if psql "${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/trading-ci}" -c "SELECT 1;" > /dev/null 2>&1; then
+    # 尝试从 .env 文件读取 DATABASE_URL
+    DB_URL=""
+    if [ -f ".env" ]; then
+        # 从 .env 文件中提取 DATABASE_URL（处理可能的引号）
+        DB_URL=$(grep "^DATABASE_URL=" .env | cut -d'=' -f2- | sed "s/^['\"]//;s/['\"]$//" | head -1)
+    fi
+    
+    # 如果 .env 中没有，尝试环境变量
+    if [ -z "$DB_URL" ]; then
+        DB_URL="${DATABASE_URL:-}"
+    fi
+    
+    # 如果还是没有，使用默认值
+    if [ -z "$DB_URL" ]; then
+        DB_URL="postgresql://postgres:postgres@localhost:5432/trading-ci"
+        print_warning "使用默认数据库连接: $DB_URL"
+    else
+        print_info "使用 DATABASE_URL: ${DB_URL%%@*}@***"
+    fi
+    
+    # 测试连接
+    if psql "$DB_URL" -c "SELECT 1;" > /dev/null 2>&1; then
         print_success "数据库连接正常"
     else
         print_error "数据库连接失败"
-        echo "   请检查 DATABASE_URL 配置"
-        exit 1
+        echo "   连接字符串: ${DB_URL%%@*}@***"
+        echo "   请检查："
+        echo "   1. DATABASE_URL 格式是否正确"
+        echo "   2. 数据库服务是否运行"
+        echo "   3. 用户名密码是否正确"
+        echo "   4. 数据库是否存在"
+        echo ""
+        echo "   测试命令："
+        echo "   psql \"$DB_URL\" -c \"SELECT 1;\""
+        # 不退出，允许继续检查其他项
     fi
 else
     print_warning "未安装 psql，跳过数据库检查"
+    echo "   可以通过 Docker 容器检查："
+    echo "   docker compose exec execution psql \$DATABASE_URL -c \"SELECT 1;\""
 fi
 
 # 检查 Redis 连接
