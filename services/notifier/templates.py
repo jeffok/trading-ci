@@ -102,7 +102,9 @@ def _render_position_closed(*, symbol: str, direction: str, payload: Dict[str, A
 
     reason = _safe(payload.get("reason") or detail.get("reason"))
     if reason and reason not in ("POSITION_CLOSED", "EXITED"):
-        lines.append(f"原因：{reason}")
+        # 防止 reason 中包含未转义的格式化字符串
+        safe_reason = str(reason).replace("{", "{{").replace("}", "}}")
+        lines.append(f"原因：{safe_reason}")
 
     return "\n".join([x for x in lines if x])
 
@@ -249,7 +251,9 @@ def render_risk_event(evt: Dict[str, Any]) -> Tuple[str, str]:
             lines.append(f"until_ts_ms：{until_ts_ms}")
         rsn = _safe(detail.get("reason"))
         if rsn:
-            lines.append(f"原因：{rsn}")
+            # 防止 reason 中包含未转义的格式化字符串
+            safe_rsn = str(rsn).replace("{", "{{").replace("}", "}}")
+            lines.append(f"原因：{safe_rsn}")
         return sev, "\n".join([x for x in lines if x])
 
     if typ in ("DATA_GAP", "DATA_LAG"):
@@ -331,7 +335,9 @@ def render_risk_event(evt: Dict[str, Any]) -> Tuple[str, str]:
             "🛑 账户熔断（Kill Switch）已开启" + (f"：{symbol}" if symbol else ""),
         ]
         if reason:
-            lines.append(f"原因：{reason}")
+            # 防止 reason 中包含未转义的格式化字符串
+            safe_reason = str(reason).replace("{", "{{").replace("}", "}}")
+            lines.append(f"原因：{safe_reason}")
         return sev, "\n".join([x for x in lines if x])
 
     if typ == "MAX_POSITIONS_BLOCKED":
@@ -438,7 +444,9 @@ def render_risk_event(evt: Dict[str, Any]) -> Tuple[str, str]:
         if order_id:
             lines.append(f"order_id：{order_id}")
         if reason:
-            lines.append(f"reason：{reason}")
+            # 防止 reason 中包含未转义的格式化字符串
+            safe_reason = str(reason).replace("{", "{{").replace("}", "}}")
+            lines.append(f"reason：{safe_reason}")
         return sev, "\n".join([x for x in lines if x])
 
     if typ == "ORDER_PARTIAL_FILL":
@@ -481,6 +489,8 @@ def render_risk_event(evt: Dict[str, Any]) -> Tuple[str, str]:
     # Keep detail short
     msg = _safe(detail.get("message") or detail.get("reason") or detail.get("error"))
     if msg:
-        lines.append(f"detail：{msg}")
+        # 防止消息中包含未转义的格式化字符串（如 {group}）
+        safe_msg = str(msg).replace("{", "{{").replace("}", "}}")
+        lines.append(f"detail：{safe_msg}")
 
     return sev, "\n".join(lines)

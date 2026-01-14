@@ -82,7 +82,9 @@ async def run_trade_plan_consumer() -> None:
                 # ✅ 关键：直接打印堆栈，docker logs 必然可见
                 print(tb, flush=True)
                 # ✅ 关键：把 error 拼进 message（你当前日志格式不显示 extra_fields）
-                logger.warning(f"trade_plan_process_failed: {e}", extra={"extra_fields": {"event": "TRADE_PLAN_FAILED", "error": str(e)}})
+                # 防止错误消息中包含未转义的格式化字符串
+                error_str = str(e).replace("{", "{{").replace("}", "}}")
+                logger.warning(f"trade_plan_process_failed: {error_str}", extra={"extra_fields": {"event": "TRADE_PLAN_FAILED", "error": str(e)}})
 
                 try:
                     ev = build_risk_event(
