@@ -198,7 +198,6 @@ async def run_marketdata() -> None:
         handle_confirmed_candle(
             database_url=settings.database_url,
             redis_url=settings.redis_url,
-            settings=settings,
             symbol=symbol,
             timeframe=tf,
             candle={
