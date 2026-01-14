@@ -130,7 +130,7 @@ def update_runner_stop_and_secondary_rule(
         low = [b["low"] for b in bars]
 
         # ---------------- Secondary rule: 只检查 entry 后第一根 bar ----------------
-        if not p["secondary_rule_checked"] and close_time_ms > int(p["entry_close_time_ms"]):
+        if getattr(settings, "secondary_rule_enabled", True) and (not p["secondary_rule_checked"]) and close_time_ms > int(p["entry_close_time_ms"]):
             hist_entry = p["hist_entry"]
             hist_now = _hist_last(close)
             ok = True

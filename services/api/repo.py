@@ -53,7 +53,13 @@ def list_positions(database_url: str, limit: int = 50) -> List[Dict[str, Any]]:
 
 
 def list_execution_reports(database_url: str, limit: int = 50) -> List[Dict[str, Any]]:
-    sql = "SELECT report_id, symbol, type, severity, created_at FROM execution_reports ORDER BY created_at DESC LIMIT %s"
+    sql = """
+    SELECT report_id, symbol, type, severity, created_at,
+           plan_id, status, timeframe, filled_qty, avg_price, reason
+    FROM execution_reports
+    ORDER BY created_at DESC
+    LIMIT %s
+    """
     with get_conn(database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (limit,))
@@ -86,7 +92,13 @@ def get_risk_state(database_url: str, trade_date: str) -> Dict[str, Any]:
 
 
 def list_risk_events(database_url: str, trade_date: str, limit: int = 50) -> List[Dict[str, Any]]:
-    sql = "SELECT event_id, ts_ms, type, severity, detail FROM risk_events WHERE trade_date=%s ORDER BY ts_ms DESC LIMIT %s"
+    sql = """
+    SELECT event_id, ts_ms, type, severity, symbol, retry_after_ms, detail
+    FROM risk_events
+    WHERE trade_date=%s
+    ORDER BY ts_ms DESC
+    LIMIT %s
+    """
     with get_conn(database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (trade_date, limit))

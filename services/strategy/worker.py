@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional
 from libs.common.config import settings
 from libs.common.logging import setup_logging
 from libs.common.time import now_ms
+from libs.common.timeframe import timeframe_ms
 from libs.mq.redis_streams import RedisStreamsClient
 from libs.mq.dlq import publish_dlq
 from libs.mq.schema_validator import validate
@@ -42,7 +43,14 @@ from libs.strategy.divergence import detect_three_segment_divergence
 from libs.strategy.confluence import Candle, vegas_state, engulfing, rsi_divergence, obv_divergence, fvg_proximity
 from libs.strategy.scoring import DivergenceFeatures, divergence_strength as div_strength_score, confluence_strength, signal_quality_score
 
-from services.strategy.repo import get_bars, save_signal, save_trade_plan
+from services.strategy.repo import (
+    get_bars,
+    save_signal,
+    save_trade_plan,
+    upsert_setup,
+    upsert_trigger,
+    upsert_pivot,
+)
 from services.strategy.publisher import (
     build_signal_event, publish_signal,
     build_trade_plan_event, publish_trade_plan,
@@ -177,28 +185,58 @@ async def process_bar_close(event: Dict[str, Any]) -> None:
             bias=bias,
             setup_type="MACD_3SEG_DIVERGENCE",
             payload={
-                "p1": {"i": int(setup.p1), "price": float(setup.price1), "hist": float(setup.h1)},
-                "p2": {"i": int(setup.p2), "price": float(setup.price2), "hist": float(setup.h2)},
-                "p3": {"i": int(setup.p3), "price": float(setup.price3), "hist": float(setup.h3)},
+                "p1": {"i": int(setup.p1.index), "price": float(setup.p1.price), "hist": float(setup.h1)},
+                "p2": {"i": int(setup.p2.index), "price": float(setup.p2.price), "hist": float(setup.h2)},
+                "p3": {"i": int(setup.p3.index), "price": float(setup.p3.price), "hist": float(setup.h3)},
             },
         )
 
         # 2) pivots：至少把三段对应的 pivot 落库（pivot_time_ms 用 bars 的 close_time_ms 近似）
         # 注意：p1/p2/p3 是序列索引，这里用 candles 索引映射到 close_time_ms。
         # 如果后续需要更精确，可把 pivot_time_ms 绑定到 open_time_ms/close_time_ms 对应的 bar。
-        p1_ct = int(bars[int(setup.p1)]["close_time_ms"])
-        p2_ct = int(bars[int(setup.p2)]["close_time_ms"])
-        p3_ct = int(bars[int(setup.p3)]["close_time_ms"])
+        p1_ct = int(bars[int(setup.p1.index)]["close_time_ms"])
+        p2_ct = int(bars[int(setup.p2.index)]["close_time_ms"])
+        p3_ct = int(bars[int(setup.p3.index)]["close_time_ms"])
 
         # LONG：低点；SHORT：高点（此处仅用于 pivot_type 复盘标注）
         ptype = "LOW" if bias == "LONG" else "HIGH"
 
-        upsert_pivot(settings.database_url, pivot_id=f"{setup_id}:1", setup_id=setup_id, symbol=symbol, timeframe=timeframe,
-                     pivot_time_ms=p1_ct, pivot_price=float(setup.price1), pivot_type=ptype, segment_no=1, meta={"hist": float(setup.h1), "i": int(setup.p1)})
-        upsert_pivot(settings.database_url, pivot_id=f"{setup_id}:2", setup_id=setup_id, symbol=symbol, timeframe=timeframe,
-                     pivot_time_ms=p2_ct, pivot_price=float(setup.price2), pivot_type=ptype, segment_no=2, meta={"hist": float(setup.h2), "i": int(setup.p2)})
-        upsert_pivot(settings.database_url, pivot_id=f"{setup_id}:3", setup_id=setup_id, symbol=symbol, timeframe=timeframe,
-                     pivot_time_ms=p3_ct, pivot_price=float(setup.price3), pivot_type=ptype, segment_no=3, meta={"hist": float(setup.h3), "i": int(setup.p3)})
+        upsert_pivot(
+            settings.database_url,
+            pivot_id=f"{setup_id}:1",
+            setup_id=setup_id,
+            symbol=symbol,
+            timeframe=timeframe,
+            pivot_time_ms=p1_ct,
+            pivot_price=float(setup.p1.price),
+            pivot_type=ptype,
+            segment_no=1,
+            meta={"hist": float(setup.h1), "i": int(setup.p1.index)},
+        )
+        upsert_pivot(
+            settings.database_url,
+            pivot_id=f"{setup_id}:2",
+            setup_id=setup_id,
+            symbol=symbol,
+            timeframe=timeframe,
+            pivot_time_ms=p2_ct,
+            pivot_price=float(setup.p2.price),
+            pivot_type=ptype,
+            segment_no=2,
+            meta={"hist": float(setup.h2), "i": int(setup.p2.index)},
+        )
+        upsert_pivot(
+            settings.database_url,
+            pivot_id=f"{setup_id}:3",
+            setup_id=setup_id,
+            symbol=symbol,
+            timeframe=timeframe,
+            pivot_time_ms=p3_ct,
+            pivot_price=float(setup.p3.price),
+            pivot_type=ptype,
+            segment_no=3,
+            meta={"hist": float(setup.h3), "i": int(setup.p3.index)},
+        )
     except Exception:
         pass
 
@@ -248,6 +286,9 @@ async def process_bar_close(event: Dict[str, Any]) -> None:
         hits=hits,
         signal_score=signal_score_int,
         payload=signal_event,
+        status="NEW",
+        valid_from_ms=int(signal_event["payload"]["close_time_ms"]),
+        expires_at_ms=int(signal_event["payload"]["close_time_ms"]) + int(getattr(settings, "signal_ttl_bars", 1)) * timeframe_ms(signal_event["payload"]["timeframe"]),
     )
 
     logger.info("signal_emitted", extra={"extra_fields": {"event":"SIGNAL_EMIT","symbol":symbol,"timeframe":timeframe,"bias":bias,"hits":hits}})
@@ -260,6 +301,20 @@ async def process_bar_close(event: Dict[str, Any]) -> None:
         side = "BUY" if bias == "LONG" else "SELL"
         plan_id = _plan_id(symbol, timeframe, close_time_ms, bias)
 
+        # Stage 8: lifecycle ttl for trade_plan. Default: 1 bar.
+        ttl_bars = int(getattr(settings, "trade_plan_ttl_bars", 1))
+        ttl_ms = int(timeframe_ms(timeframe) * max(ttl_bars, 1))
+        expires_at_ms = int(close_time_ms + ttl_ms)
+
+        ext_payload = {"close_time_ms": close_time_ms, "scoring": scoring_ext}
+        if run_id:
+            ext_payload["run_id"] = run_id
+        ext_payload.update({
+            "status": "NEW",
+            "valid_from_ms": int(close_time_ms),
+            "expires_at_ms": int(expires_at_ms),
+        })
+
         plan_event = build_trade_plan_event(
             plan_id=plan_id,
             idempotency_key=idem,
@@ -271,7 +326,7 @@ async def process_bar_close(event: Dict[str, Any]) -> None:
             primary_sl_price=primary_sl,
             setup_id=setup_id,
             trigger_id=trigger_id,
-            ext={"close_time_ms": close_time_ms, "scoring": scoring_ext, "run_id": run_id} if run_id else {"close_time_ms": close_time_ms, "scoring": scoring_ext},
+            ext=ext_payload,
         )
         publish_trade_plan(settings.redis_url, plan_event)
 
@@ -286,6 +341,9 @@ async def process_bar_close(event: Dict[str, Any]) -> None:
             entry_price=entry_price,
             primary_sl_price=primary_sl,
             payload=plan_event,
+            status="NEW",
+            valid_from_ms=int(close_time_ms),
+            expires_at_ms=int(expires_at_ms),
         )
 
         logger.info("trade_plan_emitted", extra={"extra_fields": {"event":"TRADE_PLAN_EMIT","symbol":symbol,"timeframe":timeframe,"side":side,"plan_id":plan_id}})

@@ -51,17 +51,29 @@ def get_bars(database_url: str, *, symbol: str, timeframe: str, limit: int = 500
 UPSERT_SIGNAL_SQL = """
 INSERT INTO signals (
   signal_id, idempotency_key, symbol, timeframe, close_time_ms,
-  bias, vegas_state, hit_count, hits, signal_score, payload
+  bias, vegas_state, hit_count, hits, signal_score,
+  status, valid_from_ms, expires_at_ms, updated_at,
+  payload
 ) VALUES (
   %(signal_id)s, %(idempotency_key)s, %(symbol)s, %(timeframe)s, %(close_time_ms)s,
-  %(bias)s, %(vegas_state)s, %(hit_count)s, %(hits)s::jsonb, %(signal_score)s, %(payload)s::jsonb
+  %(bias)s, %(vegas_state)s, %(hit_count)s, %(hits)s::jsonb, %(signal_score)s,
+  %(status)s, %(valid_from_ms)s, %(expires_at_ms)s, now(),
+  %(payload)s::jsonb
 )
-ON CONFLICT (idempotency_key) DO NOTHING;
+ON CONFLICT (idempotency_key) DO UPDATE SET
+  hit_count = EXCLUDED.hit_count,
+  hits = EXCLUDED.hits,
+  signal_score = EXCLUDED.signal_score,
+  status = COALESCE(EXCLUDED.status, signals.status),
+  valid_from_ms = COALESCE(EXCLUDED.valid_from_ms, signals.valid_from_ms),
+  expires_at_ms = COALESCE(EXCLUDED.expires_at_ms, signals.expires_at_ms),
+  updated_at = now(),
+  payload = EXCLUDED.payload;
 """
 
 
 def save_signal(database_url: str, *, signal_id: str, idempotency_key: str, symbol: str, timeframe: str, close_time_ms: int,
-                bias: str, vegas_state: str, hit_count: int, hits: List[str], signal_score: Optional[int], payload: Dict[str, Any]) -> None:
+                bias: str, vegas_state: str, hit_count: int, hits: List[str], signal_score: Optional[int], payload: Dict[str, Any], status: str = "NEW", valid_from_ms: int = 0, expires_at_ms: int = 0) -> None:
     with get_conn(database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(UPSERT_SIGNAL_SQL, {
@@ -83,17 +95,18 @@ def save_signal(database_url: str, *, signal_id: str, idempotency_key: str, symb
 UPSERT_TRADE_PLAN_SQL = """
 INSERT INTO trade_plans (
   plan_id, idempotency_key, symbol, timeframe, close_time_ms,
-  side, entry_price, primary_sl_price, payload
+  side, entry_price, primary_sl_price, status, valid_from_ms, expires_at_ms, payload
 ) VALUES (
   %(plan_id)s, %(idempotency_key)s, %(symbol)s, %(timeframe)s, %(close_time_ms)s,
-  %(side)s, %(entry_price)s, %(primary_sl_price)s, %(payload)s::jsonb
+  %(side)s, %(entry_price)s, %(primary_sl_price)s, %(status)s, %(valid_from_ms)s, %(expires_at_ms)s, %(payload)s::jsonb
 )
 ON CONFLICT (idempotency_key) DO NOTHING;
 """
 
 
 def save_trade_plan(database_url: str, *, plan_id: str, idempotency_key: str, symbol: str, timeframe: str, close_time_ms: int,
-                    side: str, entry_price: float, primary_sl_price: float, payload: Dict[str, Any]) -> None:
+                    side: str, entry_price: float, primary_sl_price: float, payload: Dict[str, Any],
+                    status: str = "NEW", valid_from_ms: int = 0, expires_at_ms: int = 0) -> None:
     with get_conn(database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(UPSERT_TRADE_PLAN_SQL, {
@@ -105,6 +118,9 @@ def save_trade_plan(database_url: str, *, plan_id: str, idempotency_key: str, sy
                 "side": side,
                 "entry_price": entry_price,
                 "primary_sl_price": primary_sl_price,
+                "status": status,
+                "valid_from_ms": int(valid_from_ms),
+                "expires_at_ms": int(expires_at_ms),
                 "payload": json.dumps(payload, ensure_ascii=False),
             })
             conn.commit()

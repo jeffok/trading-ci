@@ -1,6 +1,87 @@
 # -*- coding: utf-8 -*-
 # Changelog
 
+
+
+
+## [2026-01-14] Stage 11：数据质量监控 + ATR/NEWS 市场状态 + Kill Switch + Signals 生命周期
+- marketdata-service：接入 gapfill 幂等发布（bar_close_emits）并补齐 DATA_GAP 回填链路；新增 DATA_LAG/BAR_DUPLICATE/PRICE_JUMP/VOLUME_ANOMALY 数据质量告警
+- marketdata-service：MarketStateTracker 升级为 ATR/close 判定 HIGH_VOL，并支持 NEWS_WINDOW_UTC 时间窗标记（仅告警，不影响策略）
+- execution-service：新增 Kill Switch（ENV FORCE_ON + runtime_flags DB 开关）阻断新开仓，并发布 KILL_SWITCH_ON 风险事件（窗口去重）
+- strategy-service：signals 表补齐 status/valid_from_ms/expires_at_ms/updated_at 生命周期字段（迁移 V151），写入 signal TTL
+- migrations：新增 V150(runtime_flags) / V151(signals lifecycle)；schemas/risk-event.json enum 扩展 BAR_DUPLICATE/PRICE_JUMP/VOLUME_ANOMALY
+- notifier-service：新增 DATA_LAG/DATA_GAP/BAR_DUPLICATE/PRICE_JUMP/VOLUME_ANOMALY/KILL_SWITCH_ON 的 TG 模板；新增 Stage11 自测脚本 scripts/e2e_stage11_selftest.py
+- 配置：新增 DATA_QUALITY_* / MARKET_ATR_PERIOD / NEWS_WINDOW_UTC / SIGNAL_TTL_BARS / ACCOUNT_KILL_SWITCH_FORCE_ON 等配置项
+
+## [2026-01-14] Stage 10：WS+REST 钱包一致性（wallet snapshots + drift 告警）+ execution 成交收敛增强
+- execution-service：新增 wallet_snapshots 表（迁移 V140），同时记录 WS/REST 钱包快照（审计/对账）
+- execution-service：private WS wallet topic 增加快照解析与落库（repo.upsert_wallet_snapshot_from_ws）
+- snapshotter：REST wallet 快照落库，并与最新 WS 快照做漂移检测，超过阈值发布 risk_event: CONSISTENCY_DRIFT(scope=wallet)，带窗口去重
+- WS execution：当 fills 聚合达到订单 qty 时，主动将订单收敛为 FILLED 并发布 execution_report（减少仅靠 order topic 的延迟/漏报）
+- 配置：新增 WALLET_COMPARE_ENABLED / BYBIT_WALLET_COIN / WALLET_WS_MAX_AGE_MS / WALLET_DRIFT_THRESHOLD_PCT / WALLET_DRIFT_WINDOW_MS；.env.example 同步
+
+## [2026-01-14] Stage 9：入场异常处理（14.3）+ fills 明细落库 + 告警闭环完善
+- execution-service：新增 order_manager 对 ENTRY Limit 订单 timeout/partial-fill stall 的 cancel/retry/reprice/fallback（默认 Market 不改变行为）
+- execution-service：orders 增加辅助列 submitted_at_ms/retry_count/filled_qty/avg_price/last_fill_at_ms（迁移 V130）
+- execution-service：新增 fills 表落库（WS execution -> fills；并回写 orders 聚合字段，供对账/告警）
+- execution-service：reconcile 集成 pending ENTRY 处理，形成 ORDER_TIMEOUT/ORDER_PARTIAL_FILL/ORDER_RETRY/ORDER_FALLBACK_MARKET 的告警闭环
+- notifier-service：补齐 ORDER_RETRY/ORDER_FALLBACK_MARKET/ORDER_CANCELLED 模板
+- schemas：risk_event 枚举扩展 + risk_normalize 映射扩展
+- scripts：新增 scripts/e2e_stage9_order_manager_selftest.py（无外部依赖逻辑自测）
+- 修复：配置文件合并残留导致的语法错误（libs/common/config.py）
+
+## [2026-01-14] Stage 8：生命周期+指标+告警增强（不改变策略）
+- strategy-service：trade_plan 增加生命周期字段（status/valid_from_ms/expires_at_ms），并落库到 trade_plans 新列（V121）
+- execution-service：对已过期 trade_plan 直接 REJECTED 并发布 risk_event:SIGNAL_EXPIRED（避免“过期信号”误执行）
+- execution-service：execution_report 支持 fill_ratio（V120 + schema + repo/publisher）
+- marketdata-service：新增 MARKET_STATE（HIGH_VOL/NORMAL）标记（仅观测/告警，不参与策略），支持阈值与去重
+- execution-service：reconcile 增加 ORDER_TIMEOUT / ORDER_PARTIAL_FILL 告警（基于 open_orders createdTime，窗口去重）
+- notifier-service：新增 risk_event 模板：SIGNAL_EXPIRED / ORDER_TIMEOUT / ORDER_PARTIAL_FILL / MARKET_STATE
+- 配置：新增 TRADE_PLAN_TTL_BARS / MARKET_STATE_* / ORDER_TIMEOUT_ALERT_WINDOW_MS；.env.example 同步
+
+
+## Stage 6.1 + Stage 7.1 (Patch)
+
+- Secondary Rule: 当策略未提供 hist_entry 时，execution 会从 bars 表推导 entry bar 的 MACD histogram，避免二级规则成为空操作（不改变策略，仅补齐执行所需指标）。
+- Secondary Rule 开关：新增 SECONDARY_RULE_ENABLED，可在不改代码情况下开启/关闭二级规则检查。
+- Runner trailing（Live）：TP2 成交后，Runner 的 stopLoss 可以持续更新（只更严格、不放松），并带最小更新间隔 RUNNER_LIVE_UPDATE_MIN_INTERVAL_MS。
+- WS 优先 & 降低 private REST 压力：BYBIT_PRIVATE_WS_ENABLED=true 时，对 open_orders 轮询做间隔退避（RECONCILE_OPEN_ORDERS_POLL_INTERVAL_SEC），仍保留 REST 兜底。
+- WS→DB 元数据闭环：WS order TP1/TP2 成交会写入 positions.meta.tp*_filled，WS position 快照会写入 positions.meta.ws_position（仅用于对账/漂移检测）。
+- 一致性漂移告警：新增 risk_event 类型 CONSISTENCY_DRIFT，发现 WS size 与本地 qty_total 偏差超过阈值（默认 10%）时告警，并带窗口去重。
+
+
+## [2026-01-13] Stage 5：10006 限频治理收口（全局/分桶 limiter + public-first + 更强降级闭环）
+- 增强：Bybit REST 限频治理按 endpoint 维度更细分桶：PRIVATE_CRITICAL / PRIVATE_ORDER_QUERY / PRIVATE_ACCOUNT_QUERY
+- 增强：全局 + 分交易对 token-bucket；并基于 Bybit 头部（X-Bapi-Limit-Status/X-Bapi-Limit/X-Bapi-Limit-Reset-Timestamp/Retry-After）自适应降频与冷却
+- 优化：observability public-first —— 当 DB 无 OPEN positions 时，快照跳过 /v5/position/list（避免无效 private 压力）
+- 修复：repo.list_open_positions 增加 limit 参数（供 snapshotter/backtest 使用），并添加 ORDER BY/LIMIT
+- 更新：scripts/ratelimit_selftest.py 覆盖新的分桶模型与统计输出
+- 更新：.env.example 补齐 Stage 5 限频配置项
+
+## [2026-01-13] Stage 4：更完整的 10006 限频治理（全局/分交易对）+ endpoint 分桶 + 自适应冷却 + 降级告警闭环
+- 新增：`libs/bybit/ratelimit.py` 进程内 rate limiter（单实例）
+  - 私有接口按 *关键交易* vs *查询类* 分桶，防止查询把下单/止损饿死
+  - 全局 + 分交易对（per-symbol）双层令牌桶
+  - 根据 Bybit header（X-Bapi-Limit-Status / X-Bapi-Limit-Reset-Timestamp / Retry-After）自适应冷却
+- 增强：`TradeRestV5Client` 私有/公有请求统一注入 limiter，并把 headers/wait_ms 注入错误 raw 供告警使用
+- 新增：私有查询接口 TTL cache（wallet_balance / position_list / open_orders），并在预测等待过长时返回“陈旧但可用”的降级数据（携带 _degraded/_stale_ms/_predicted_wait_ms）
+- 增强：execution 侧（risk_monitor / snapshotter / position_sync / reconcile）遇到降级数据会发布 risk_event: RATE_LIMIT（形成告警闭环）
+- 新增：`scripts/ratelimit_selftest.py` 本地自测脚本（不调用交易所）
+
+## [2026-01-12] Stage 2：Telegram 交易详情 + 盈亏/连亏统计 + Bybit 10006 限频告警
+- 新增：Telegram 模板（开仓/平仓/TP/SL/拒单/限频），平仓消息包含数量、开/平仓均价、PnL(USDT)、连续亏损次数。
+- 新增：paper/backtest 平仓盈亏计算 pnl_usdt 与平仓均价 exit_avg_price，并写入 execution_report.payload.ext。
+- 新增：risk_state.meta.consecutive_loss_count 统计（盈利/打平归零，亏损+1）仅用于通知/观测，不改变策略。
+- 增强：Bybit 私有 REST 遇到 10006/429 时优先按 retry_after_ms 退避重试，并发布 risk_event: RATE_LIMIT（包含 endpoint 与“优先使用 public API”建议）。
+- 修复：paper_sim 解析 bar_close.ohlcv 同时兼容 dict 与 legacy list。
+
+## [2026-01-12] Stage 1：事件契约对齐 + Notifier 基础渲染（execution_report / risk_event）
+- 兼容：execution_report 保持旧调用签名，但发布新的 schema payload（plan_id/status/timeframe/filled_qty/avg_price/reason），并把 legacy 字段写入 payload.ext。
+- 新增：risk_event type/severity 归一化（严格映射到 schema enum），并保留 legacy_type/legacy_severity 到 detail。
+- 新增：execution_reports/risk_events 表新增 schema 对齐列（迁移 V090__schema_align_execution_reports_and_risk_events.sql），API 查询可返回 plan_id/status 等。
+- 新增：notifier 对 execution_report/risk_event 的基础模板渲染（Stage 1 minimal），并兼容 CRITICAL/IMPORTANT 推送。
+- 增强：execution_report 发布时自动落库（失败不阻塞交易主链路）。
+
 ## [2026-01-12] Stage 7：一键回放 + 等待链路空闲 + 自动生成回测报告（CI/回放收口）
 - 新增：scripts/run_replay_and_report.py（回放 + 等待 + 报告）
 - 新增：API /v1/backtest-compare（按 run_id 汇总链路产物与提示）
@@ -57,6 +138,14 @@
 - 新增：kill-switch 运维接口（/v1/admin/kill-switch）与 RISK_CIRCUIT_ENABLED 开关
 - 新增：迁移 V050__execution_constraints.sql（cooldowns 表 + positions 补充字段）
 
+## [2026-01-13] Stage 6：执行闸门补齐（最大持仓/互斥升级/冷却落地/TP 撤销闭环）
+- 新增：trade_plan 执行前闸门（冷却/最大同时持仓数/同币种同向互斥 + 周期优先级 1d>4h>1h）
+- 行为：当高优先级周期信号到来且存在低优先级同向仓位时，best-effort 先市价退出低优先级仓位（mutex_upgrade）
+- 新增：paper/backtest 在 PRIMARY_SL_HIT 时写入 cooldowns（按 timeframe bars），并在闸门侧阻断冷却期再入场
+- 新增：规则退出/强制退出/互斥升级时，best-effort 撤销 TP1/TP2（live 先撤单，paper/backtest 直接落库为 CANCELED）
+- 更新：notifier 对 COOLDOWN_BLOCKED / MAX_POSITIONS_BLOCKED / POSITION_MUTEX_BLOCKED 提供更友好的 Telegram 文本
+- 新增：迁移 V100__stage6_cooldowns_and_position_close_cols.sql（cooldowns 表 + positions 补充字段）
+
 ## [2026-01-12] Phase 6：实盘安全与稳定性增强（Retry / DLQ / 账户级熔断）
 - Bybit REST：新增错误分类与指数退避重试（429/5xx/系统繁忙/超时等）
 - 新增：DLQ（stream:dlq）用于坏消息/异常消息沉淀与排障
@@ -109,3 +198,13 @@
 - 新增：统一配置加载、结构化日志（JSON）、Redis Streams 初始化与消费骨架
 - 新增：事件契约（JSON Schema）落地到 `libs/schemas`
 - 新增：docker-compose（仅业务服务，外部 DB/Redis）与示例 `.env.example`
+
+## [2026-01-14] Stage 9 (14.3 Abnormal handling + fills persistence)
+- 新增：`migrations/postgres/V130__fills_and_order_stats.sql`：增加 `fills` 表与 orders 辅助字段（submitted_at_ms/retry_count/filled_qty/avg_price/last_fill_at_ms）
+- 新增：`services/execution/order_manager.py`：ENTRY 限价单超时/部分成交停滞的撤单→重试→（可选）降级市价闭环，并发送 risk_event 告警
+- 增强：`services/execution/reconcile.py` 调用 order_manager，在 LIVE 模式下对 pending ENTRY 限价单做治理
+- 增强：`services/execution/ws_private_ingest.py` 将 execution fills 规范化写入 `orders.payload.fills` + `fills` 表，并更新 orders 聚合字段
+- 增强：`services/execution/repo.py` 支持 fills 写入、按状态查询订单、WS 状态写入 cumExecQty/avgPrice
+- 更新：`libs/schemas/streams/risk-event.json` 增加 ORDER_RETRY / ORDER_FALLBACK_MARKET / ORDER_CANCELLED
+- 更新：`services/notifier/templates.py` 增加上述告警类型的 Telegram 文本模板
+- 更新：`.env.example` 增加 Stage9 配置项（默认不改变策略：Market entry）

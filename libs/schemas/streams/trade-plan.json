@@ -211,6 +211,25 @@
         },
         "ext": {
           "type": "object"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "NEW",
+            "SENT",
+            "EXECUTED",
+            "EXPIRED",
+            "CANCELED",
+            "FAILED"
+          ]
+        },
+        "valid_from_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expires_at_ms": {
+          "type": "integer",
+          "minimum": 0
         }
       },
       "additionalProperties": false

@@ -25,6 +25,7 @@ from services.execution.executor import execute_trade_plan
 from services.execution.lifecycle import on_bar_close
 from services.execution.paper_sim import process_paper_bar_close
 from services.execution.reconcile import run_reconcile_once
+from services.execution.ws_private_ingest import run_private_ws_ingest_loop
 from services.execution.risk_monitor import run_risk_monitor_once
 from services.execution.position_sync import sync_positions
 from services.execution.snapshotter import run_snapshot_loop
@@ -184,4 +185,5 @@ async def run_execution() -> None:
         run_risk_monitor_loop(),
         run_position_sync_loop(),
         run_snapshot_loop(),
+        run_private_ws_ingest_loop(),
     )

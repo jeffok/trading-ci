@@ -32,6 +32,7 @@ from services.notifier.repo import (
     backoff_seconds,
 )
 from services.notifier.telegram import send_telegram
+from services.notifier.templates import render_execution_report, render_risk_event
 
 logger = setup_logging("notifier-service")
 
@@ -63,8 +64,9 @@ def _parse(fields: Dict[str, Any], schema: str) -> Dict[str, Any]:
 
 
 def _maybe_notify(text: str, severity: str) -> bool:
-    # 只对 IMPORTANT/EMERGENCY 推送（可按需调整）
-    if severity not in ("IMPORTANT", "EMERGENCY"):
+    # Stage 1: 只对 IMPORTANT/CRITICAL/EMERGENCY 推送（兼容历史值）
+    sev = (severity or "").strip().upper()
+    if sev not in ("IMPORTANT", "CRITICAL", "EMERGENCY"):
         return False
     send_telegram(bot_token=settings.telegram_bot_token, chat_id=settings.telegram_chat_id, text=text)
     return True
@@ -90,11 +92,13 @@ async def run_notifier_stream_consumer() -> None:
             for m in msgs:
                 try:
                     evt = _parse(m.fields, schema)
-                    payload = evt.get("payload", {})
-                    sev = payload.get("severity") or payload.get("type") or "INFO"
-                    text = json.dumps(payload, ensure_ascii=False)
 
-                    logger.info("notify_event", extra={"extra_fields": {"stream": stream, "payload": payload}})
+                    if stream == STREAM_EXEC_REPORT:
+                        sev, text = render_execution_report(evt)
+                    else:
+                        sev, text = render_risk_event(evt)
+
+                    logger.info("notify_event", extra={"extra_fields": {"stream": stream, "severity": sev}})
 
                     notification_id = evt.get("event_id") or evt.get("report_id") or evt.get("id") or m.message_id
                     notification_id = str(notification_id)

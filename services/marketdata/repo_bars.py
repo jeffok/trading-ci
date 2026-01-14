@@ -68,3 +68,72 @@ def upsert_bar(
                 },
             )
             conn.commit()
+
+
+GET_BAR_SQL = """
+SELECT open, high, low, close, volume, turnover, open_time_ms, close_time_ms, source
+FROM bars
+WHERE symbol=%(symbol)s AND timeframe=%(timeframe)s AND close_time_ms=%(close_time_ms)s
+LIMIT 1;
+"""
+
+GET_PREV_BAR_SQL = """
+SELECT open, high, low, close, volume, turnover, open_time_ms, close_time_ms, source
+FROM bars
+WHERE symbol=%(symbol)s AND timeframe=%(timeframe)s AND close_time_ms < %(close_time_ms)s
+ORDER BY close_time_ms DESC
+LIMIT 1;
+"""
+
+GET_RECENT_VOLUMES_SQL = """
+SELECT volume
+FROM bars
+WHERE symbol=%(symbol)s AND timeframe=%(timeframe)s AND close_time_ms <= %(close_time_ms)s
+ORDER BY close_time_ms DESC
+LIMIT %(limit)s;
+"""
+
+def get_bar(database_url: str, *, symbol: str, timeframe: str, close_time_ms: int) -> Optional[dict]:
+    with get_conn(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(GET_BAR_SQL, {"symbol": symbol, "timeframe": timeframe, "close_time_ms": int(close_time_ms)})
+            r = cur.fetchone()
+            if not r:
+                return None
+            return {
+                "open": float(r[0]),
+                "high": float(r[1]),
+                "low": float(r[2]),
+                "close": float(r[3]),
+                "volume": float(r[4]),
+                "turnover": float(r[5]) if r[5] is not None else None,
+                "open_time_ms": int(r[6]),
+                "close_time_ms": int(r[7]),
+                "source": r[8],
+            }
+
+def get_prev_bar(database_url: str, *, symbol: str, timeframe: str, close_time_ms: int) -> Optional[dict]:
+    with get_conn(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(GET_PREV_BAR_SQL, {"symbol": symbol, "timeframe": timeframe, "close_time_ms": int(close_time_ms)})
+            r = cur.fetchone()
+            if not r:
+                return None
+            return {
+                "open": float(r[0]),
+                "high": float(r[1]),
+                "low": float(r[2]),
+                "close": float(r[3]),
+                "volume": float(r[4]),
+                "turnover": float(r[5]) if r[5] is not None else None,
+                "open_time_ms": int(r[6]),
+                "close_time_ms": int(r[7]),
+                "source": r[8],
+            }
+
+def get_recent_volumes(database_url: str, *, symbol: str, timeframe: str, close_time_ms: int, limit: int = 30) -> list[float]:
+    with get_conn(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(GET_RECENT_VOLUMES_SQL, {"symbol": symbol, "timeframe": timeframe, "close_time_ms": int(close_time_ms), "limit": int(limit)})
+            rows = cur.fetchall() or []
+            return [float(r[0]) for r in rows]

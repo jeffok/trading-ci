@@ -29,12 +29,20 @@ from libs.bybit.market_rest import BybitMarketRestClient
 from libs.bybit.ws_public import BybitPublicWsClient
 
 from services.marketdata.config import MarketdataSettings
-from services.marketdata.repo_bars import upsert_bar
+from services.marketdata.repo_bars import upsert_bar, get_bar, get_prev_bar, get_recent_volumes
+from services.marketdata.data_quality import (
+    check_data_lag,
+    check_duplicate_bar,
+    check_price_jump,
+    check_volume_anomaly,
+)
+
 from services.marketdata.publisher import build_bar_close_event, publish_bar_close
 from services.marketdata.gapfill import handle_confirmed_candle
 from services.marketdata.publisher_risk import build_risk_event, publish_risk_event
 from services.marketdata.repo_risk import insert_risk_event
 from services.marketdata.derived_8h import Derived8hAggregator
+from services.marketdata.market_state import MarketStateTracker
 
 
 logger = setup_logging("marketdata-service")
@@ -154,6 +162,12 @@ async def run_marketdata() -> None:
     logger.info("ws_subscribe", extra={"extra_fields": {"event": "WS_SUBSCRIBE", "topic_count": len(topics)}})
 
     agg8h = Derived8hAggregator()
+    mstate = MarketStateTracker(
+        atr_period=int(getattr(settings, "market_atr_period", 14)),
+        high_vol_pct=float(getattr(settings, "market_high_vol_pct", 0.04)),
+        news_window_utc=str(getattr(settings, "news_window_utc", "")),
+        emit_on_normal=bool(getattr(settings, "market_state_emit_on_normal", False)),
+    )
 
     async def handle(msg: Dict[str, Any]) -> None:
         k = _parse_kline_msg(msg)
@@ -162,37 +176,116 @@ async def run_marketdata() -> None:
 
         tf, symbol = _system_tf_from_topic(k["topic"])
 
-        # 4) 写库（原生周期）
-        upsert_bar(
-            settings.database_url,
-            symbol=symbol,
-            timeframe=tf,
-            open_time_ms=k["start_ms"],
-            close_time_ms=k["end_ms"],
-            open=k["open"],
-            high=k["high"],
-            low=k["low"],
-            close=k["close"],
-            volume=k["volume"],
-            turnover=k.get("turnover"),
-            source="bybit_ws",
-        )
+        # 4) gapfill + 幂等发布 bar_close（原生周期）
+        incoming_bar = {
+            "open": k["open"],
+            "high": k["high"],
+            "low": k["low"],
+            "close": k["close"],
+            "volume": k["volume"],
+            "turnover": k.get("turnover"),
+            "open_time_ms": k["start_ms"],
+            "close_time_ms": k["end_ms"],
+            "source": "bybit_ws",
+        }
 
-        # 5) 发布 bar_close（原生周期）
-        event = build_bar_close_event(
+        # 读旧值（用于重复/修订检测）
+        existing = get_bar(settings.database_url, symbol=symbol, timeframe=tf, close_time_ms=k["end_ms"])
+        prev = get_prev_bar(settings.database_url, symbol=symbol, timeframe=tf, close_time_ms=k["end_ms"])
+        recent_vols = get_recent_volumes(settings.database_url, symbol=symbol, timeframe=tf, close_time_ms=k["end_ms"], limit=int(getattr(settings, "data_quality_volume_window", 30)))
+
+        # 缺口检测 + 回填 + 顺序补发 + 当前 bar 幂等发布（内部也会 upsert bar）
+        handle_confirmed_candle(
+            database_url=settings.database_url,
+            redis_url=settings.redis_url,
+            settings=settings,
             symbol=symbol,
             timeframe=tf,
-            close_time_ms=k["end_ms"],
-            source="bybit_ws",
-            ohlcv={
+            candle={
+                "open_time_ms": k["start_ms"],
+                "close_time_ms": k["end_ms"],
                 "open": k["open"],
                 "high": k["high"],
                 "low": k["low"],
                 "close": k["close"],
                 "volume": k["volume"],
+                "turnover": k.get("turnover"),
             },
+            source="bybit_ws",
         )
-        publish_bar_close(settings.redis_url, event)
+
+        # 5) Data quality checks（不影响交易，仅告警）
+        if bool(getattr(settings, "data_quality_enabled", True)):
+            findings = []
+            f = check_data_lag(close_time_ms=k["end_ms"], lag_threshold_ms=int(getattr(settings, "data_quality_lag_ms", getattr(settings, "alert_bar_close_lag_ms", 120000))), source_ts_ms=k.get("ts_ms"))
+            if f:
+                findings.append(f)
+            f = check_duplicate_bar(existing=existing, incoming=incoming_bar)
+            if f:
+                findings.append(f)
+            prev_close = float(prev["close"]) if prev else None
+            f = check_price_jump(prev_close=prev_close, close=k["close"], jump_pct_threshold=float(getattr(settings, "data_quality_price_jump_pct", 0.08)))
+            if f:
+                findings.append(f)
+            f = check_volume_anomaly(volume=k["volume"], recent_volumes=recent_vols, spike_multiple=float(getattr(settings, "data_quality_volume_spike_multiple", 10.0)))
+            if f:
+                findings.append(f)
+
+            for fd in findings:
+                evq = build_risk_event(typ=fd.typ, severity=fd.severity, symbol=symbol, detail={**fd.detail, "timeframe": tf, "close_time_ms": k["end_ms"], "source": "marketdata"})
+                publish_risk_event(settings.redis_url, evq)
+                insert_risk_event(settings.database_url, event_id=evq["event_id"], trade_date=evq["trade_date"], ts_ms=evq["ts_ms"], typ=fd.typ, severity=fd.severity, detail=evq["payload"]["detail"], symbol=symbol)
+
+        # 6) market state marker（不影响交易，仅告警）
+        if bool(getattr(settings, "market_state_enabled", False)):
+            st = mstate.classify_states(symbol=symbol, timeframe=tf, close_time_ms=k["end_ms"], high=k["high"], low=k["low"], close=k["close"])
+            if st is not None and mstate.should_emit(symbol=symbol, timeframe=tf, states=st.states):
+                sev = "IMPORTANT" if ("HIGH_VOL" in st.states or "NEWS_WINDOW" in st.states) else "INFO"
+                evm = build_risk_event(
+                    typ="MARKET_STATE",
+                    severity=sev,
+                    symbol=symbol,
+                    detail={
+                        "states": st.states,
+                        "atr": st.atr,
+                        "atr_pct": st.atr_pct,
+                        "range_pct": st.range_pct,
+                        "timeframe": tf,
+                        "close_time_ms": k["end_ms"],
+                        "source": "marketdata",
+                    },
+                )
+                publish_risk_event(settings.redis_url, evm)
+                insert_risk_event(settings.database_url, event_id=evm["event_id"], trade_date=evm["trade_date"], ts_ms=evm["ts_ms"], typ="MARKET_STATE", severity=sev, detail=evm["payload"]["detail"], symbol=symbol)
+
+        # Stage 8: market state marker (observability only)
+        if bool(getattr(settings, "market_state_enabled", False)):
+            st = mstate.classify(
+                symbol=symbol,
+                timeframe=tf,
+                ohlcv={
+                    "open": k["open"],
+                    "high": k["high"],
+                    "low": k["low"],
+                    "close": k["close"],
+                    "volume": k["volume"],
+                },
+            )
+            if st is not None and mstate.should_emit(symbol=symbol, timeframe=tf, state=st.state):
+                sev = "IMPORTANT" if st.state != "NORMAL" else "INFO"
+                evm = build_risk_event(
+                    typ="MARKET_STATE",
+                    severity=sev,
+                    symbol=symbol,
+                    detail={
+                        "state": st.state,
+                        "range_pct": st.range_pct,
+                        "timeframe": tf,
+                        "close_time_ms": k["end_ms"],
+                        "source": "marketdata",
+                    },
+                )
+                publish_risk_event(settings.redis_url, evm)
 
         # 6) 派生 8h（输入为 1h bar）
         if tf == "1h" and "8h" in md.timeframes:

@@ -30,6 +30,7 @@ import hashlib
 from libs.common.config import settings
 from libs.common.id import new_event_id
 from libs.common.time import now_ms
+from libs.common.timeframe import timeframe_ms
 from services.execution.publisher import build_execution_report, publish_execution_report
 from services.execution.trace import trace_step
 from services.execution.repo import (
@@ -37,8 +38,10 @@ from services.execution.repo import (
     list_orders_by_idem,
     upsert_order,
     upsert_position,
+    upsert_cooldown,
 )
 from libs.backtest.repo import insert_backtest_trade
+from services.execution.risk_state_ext import update_consecutive_loss_count
 
 
 def _bar_path(o: float, h: float, l: float, c: float) -> List[float]:
@@ -75,6 +78,49 @@ def _pnl_r(side: str, entry: float, stop: float, exit_price: float) -> float:
     return (entry - exit_price) / r
 
 
+def _realized_pnl_usdt(side: str, entry: float, legs: List[Dict[str, Any]]) -> float:
+    """Compute realized PnL in USDT for linear contracts.
+
+    legs are exit fills: TP1/TP2/SL with qty + price.
+    LONG (BUY): (exit-entry)*qty
+    SHORT (SELL): (entry-exit)*qty
+    """
+    pnl = 0.0
+    for leg in legs:
+        if leg.get("type") not in ("TP1", "TP2", "SL"):
+            continue
+        try:
+            q = float(leg.get("qty") or 0.0)
+            px = float(leg.get("price") or 0.0)
+        except Exception:
+            continue
+        if side == "BUY":
+            pnl += (px - entry) * q
+        else:
+            pnl += (entry - px) * q
+    return float(pnl)
+
+
+def _weighted_avg_exit(legs: List[Dict[str, Any]]) -> float | None:
+    num = 0.0
+    den = 0.0
+    for leg in legs:
+        if leg.get("type") not in ("TP1", "TP2", "SL"):
+            continue
+        try:
+            q = float(leg.get("qty") or 0.0)
+            px = float(leg.get("price") or 0.0)
+        except Exception:
+            continue
+        if q <= 0:
+            continue
+        num += q * px
+        den += q
+    if den <= 0:
+        return None
+    return float(num / den)
+
+
 def process_paper_bar_close(*, database_url: str, redis_url: str, bar_close_event: Dict[str, Any]) -> None:
     """在 paper/backtest 模式下，基于 bar_close 的 OHLC 模拟撮合。"""
     if settings.execution_mode == "live":
@@ -87,10 +133,17 @@ def process_paper_bar_close(*, database_url: str, redis_url: str, bar_close_even
     ext = payload.get("ext") or {}
     run_id = ext.get("run_id")
 
-    ohlcv = payload.get("ohlcv") or []
-    if len(ohlcv) < 4:
-        return
-    o, h, l, c = float(ohlcv[0]), float(ohlcv[1]), float(ohlcv[2]), float(ohlcv[3])
+    # schema uses object: {open,high,low,close,volume}; keep backward-compat with legacy list [o,h,l,c,...]
+    ohlcv = payload.get("ohlcv")
+    if isinstance(ohlcv, dict):
+        if not all(k in ohlcv for k in ("open", "high", "low", "close")):
+            return
+        o, h, l, c = float(ohlcv["open"]), float(ohlcv["high"]), float(ohlcv["low"]), float(ohlcv["close"])
+    else:
+        ohl = ohlcv or []
+        if len(ohl) < 4:
+            return
+        o, h, l, c = float(ohl[0]), float(ohl[1]), float(ohl[2]), float(ohl[3])
 
     positions = list_open_positions(database_url)
     for p in positions:
@@ -188,8 +241,21 @@ def process_paper_bar_close(*, database_url: str, redis_url: str, bar_close_even
             trace_step(database_url, trace_id=str(meta.get("trace_id") or ""), idempotency_key=idem, stage=f"{purpose}_FILLED",
                        detail={"qty": tp_qty, "price": px, "run_id": meta.get("run_id")}, ext={"run_id": meta.get("run_id")})
 
-            rep = build_execution_report(idempotency_key=idem, symbol=symbol, typ=f"{purpose}_FILLED", severity="IMPORTANT",
-                                         detail={"mode": settings.execution_mode, "qty": tp_qty, "price": px, "run_id": meta.get("run_id")})
+            rep = build_execution_report(
+                idempotency_key=idem,
+                symbol=symbol,
+                typ=f"{purpose}_FILLED",
+                severity="IMPORTANT",
+                detail={
+                    "mode": settings.execution_mode,
+                    "qty": tp_qty,
+                    "price": px,
+                    "entry_price": entry,
+                    "side": p["side"],
+                    "timeframe": timeframe,
+                    "run_id": meta.get("run_id"),
+                },
+            )
             publish_execution_report(redis_url, rep)
 
             if purpose == "TP1":
@@ -211,6 +277,43 @@ def process_paper_bar_close(*, database_url: str, redis_url: str, bar_close_even
             legs.append({"type": "SL", "qty": qty_open, "price": px, "time_ms": close_time_ms, "reason": reason})
             trace_step(database_url, trace_id=str(meta.get("trace_id") or ""), idempotency_key=idem, stage="SL_TRIGGERED",
                        detail={"qty": qty_open, "price": px, "reason": reason, "run_id": meta.get("run_id")})
+            # 标记出场原因（用于 Telegram 文本）
+            # - 未触发 TP1：primary SL
+            # - 触发 TP1 且 eff_sl==entry：break-even/secondary exit
+            # - 触发 TP2：runner stop（secondary exit）
+            if tp2_filled:
+                meta["exit_reason"] = "SECONDARY_SL_EXIT"
+            elif tp1_filled and abs(float(eff_sl) - float(entry)) < 1e-9:
+                meta["exit_reason"] = "SECONDARY_SL_EXIT"
+            else:
+                meta["exit_reason"] = "PRIMARY_SL_HIT"
+
+            # Stage 6：Primary SL 触发后写入冷却（按 timeframe 的 bar 数）。
+            # 只在 PRIMARY_SL_HIT 时进入冷却；secondary_rule/runner 退出不进入冷却。
+            try:
+                if bool(getattr(settings, "cooldown_enabled", True)) and str(meta.get("exit_reason")) == "PRIMARY_SL_HIT":
+                    tf = str(timeframe)
+                    bars = 0
+                    if tf == "1h":
+                        bars = int(getattr(settings, "cooldown_bars_1h", 2))
+                    elif tf == "4h":
+                        bars = int(getattr(settings, "cooldown_bars_4h", 1))
+                    elif tf == "1d":
+                        bars = int(getattr(settings, "cooldown_bars_1d", 1))
+                    if bars > 0:
+                        until_ts_ms = int(close_time_ms) + int(bars) * int(timeframe_ms(tf))
+                        upsert_cooldown(
+                            database_url,
+                            symbol=symbol,
+                            side=str(p.get("side") or ""),
+                            timeframe=tf,
+                            reason="PRIMARY_SL_HIT",
+                            until_ts_ms=until_ts_ms,
+                            meta={"idempotency_key": idem, "close_time_ms": int(close_time_ms)},
+                        )
+            except Exception:
+                # 冷却写入失败不阻塞回测/模拟撮合
+                pass
             qty_open = 0.0
 
         # 模拟：逐段扫描
@@ -250,6 +353,10 @@ def process_paper_bar_close(*, database_url: str, redis_url: str, bar_close_even
             meta["close_price"] = legs[-1]["price"] if legs else c
             meta["close_time_ms"] = close_time_ms
 
+            # 默认出场原因：TP_HIT / PRIMARY_SL_HIT / SIM
+            if not meta.get("exit_reason"):
+                meta["exit_reason"] = "TP_HIT" if any(x.get("type") in ("TP1", "TP2") for x in legs) else "SIM"
+
             # 计算 pnl_r（按“最终退出价”）
             stop_for_r = primary_sl
             exit_price = float(meta["close_price"])
@@ -276,12 +383,67 @@ def process_paper_bar_close(*, database_url: str, redis_url: str, bar_close_even
                 idempotency_key=idem,
             )
 
+            # 计算 USDT 计价的已实现收益（线性合约近似：qty * (exit-entry)；空头反向）
+            closed_qty = float(sum(float(x.get("qty") or 0.0) for x in legs))
+            # legs 里的 qty 可能只记录了平仓 legs（TP/SL），这里用 closed_qty 作为“总平仓量”
+            if closed_qty <= 0:
+                closed_qty = float(p.get("qty_total") or 0.0)
+
+            pnl_usdt = 0.0
+            wsum = 0.0
+            wqty = 0.0
+            for x in legs:
+                if x.get("type") not in ("TP1", "TP2", "SL"):
+                    continue
+                q = float(x.get("qty") or 0.0)
+                px = float(x.get("price") or 0.0)
+                wsum += q * px
+                wqty += q
+                if p["side"] == "BUY":
+                    pnl_usdt += (px - entry) * q
+                else:
+                    pnl_usdt += (entry - px) * q
+            exit_avg = float(wsum / wqty) if wqty > 0 else float(exit_price)
+
+            # 更新“连续亏损次数”（不改变策略，只用于通知/风控观测）
+            try:
+                import datetime
+
+                trade_date = datetime.datetime.utcnow().date().isoformat()
+                loss_count = update_consecutive_loss_count(
+                    database_url,
+                    trade_date=trade_date,
+                    mode=str(settings.execution_mode),
+                    pnl_usdt=float(pnl_usdt),
+                )
+            except Exception:
+                loss_count = None
+
             rep = build_execution_report(
                 idempotency_key=idem,
                 symbol=symbol,
                 typ="POSITION_CLOSED",
                 severity="IMPORTANT",
-                detail={"mode": settings.execution_mode, "close_price": exit_price, "pnl_r": float(pnl_r), "run_id": meta.get("run_id")},
+                detail={
+                    "mode": settings.execution_mode,
+                    "side": p["side"],
+                    "timeframe": timeframe,
+                    "filled_qty": float(closed_qty),
+                    "avg_price": float(exit_avg),
+                    "entry_price": float(entry),
+                    "close_price": float(exit_avg),
+                    "pnl_usdt": float(pnl_usdt),
+                    "pnl_r": float(pnl_r),
+                    "reason": str(meta.get("exit_reason") or "SIM"),
+                    "run_id": meta.get("run_id"),
+                },
+                ext={
+                    "pnl_usdt": float(pnl_usdt),
+                    "entry_avg_price": float(entry),
+                    "exit_avg_price": float(exit_avg),
+                    "consecutive_loss_count": int(loss_count) if loss_count is not None else None,
+                    "run_id": meta.get("run_id"),
+                },
             )
             publish_execution_report(redis_url, rep)
 

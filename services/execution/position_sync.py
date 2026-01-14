@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict
+import datetime
 
 from libs.common.config import settings
 from libs.common.time import now_ms
@@ -21,8 +22,8 @@ from libs.common.id import new_event_id
 from libs.common.timeframe import timeframe_ms
 from libs.bybit.trade_rest_v5 import BybitV5Client
 
-from services.execution.repo import list_open_positions, mark_position_closed, upsert_cooldown
-from services.execution.publisher import build_execution_report, publish_execution_report
+from services.execution.repo import list_open_positions, mark_position_closed, upsert_cooldown, insert_risk_event
+from services.execution.publisher import build_execution_report, publish_execution_report, build_risk_event, publish_risk_event
 
 
 def _bybit() -> BybitV5Client:
@@ -49,13 +50,31 @@ def sync_positions(database_url: str, redis_url: str) -> None:
         return
 
     client = _bybit()
+    trade_date = datetime.datetime.utcnow().date().isoformat()
     for p in list_open_positions(database_url):
         symbol = p["symbol"]
         idem = p["idempotency_key"]
         tf = p["timeframe"]
 
         try:
-            pos = client.position_list(category=settings.bybit_category, symbol=symbol)
+            pos = client.position_list_cached(category=settings.bybit_category, symbol=symbol)
+            if isinstance(pos, dict) and pos.get("_degraded"):
+                ev = build_risk_event(
+                    typ="RATE_LIMIT",
+                    severity="IMPORTANT",
+                    symbol=symbol,
+                    detail={"context": "position_sync.position_list_cached", "predicted_wait_ms": pos.get("_predicted_wait_ms"), "stale_ms": pos.get("_stale_ms")},
+                )
+                publish_risk_event(redis_url, ev)
+                insert_risk_event(
+                    database_url,
+                    event_id=new_event_id(),
+                    trade_date=trade_date,
+                    ts_ms=now_ms(),
+                    typ="RATE_LIMIT",
+                    severity="IMPORTANT",
+                    detail={"context": "position_sync.position_list_cached", "predicted_wait_ms": pos.get("_predicted_wait_ms"), "stale_ms": pos.get("_stale_ms"), "symbol": symbol},
+                )
             lst = pos.get("result", {}).get("list", []) or []
             size = 0.0
             if lst:

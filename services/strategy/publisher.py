@@ -114,6 +114,10 @@ def build_trade_plan_event(
             "idempotency_key": idempotency_key,
             "symbol": symbol,
             "timeframe": timeframe,
+            # Stage 8 lifecycle
+            "status": (ext or {}).get("status") or "NEW",
+            "valid_from_ms": int((ext or {}).get("valid_from_ms") or close_time_ms),
+            "expires_at_ms": int((ext or {}).get("expires_at_ms") or 0),
             "side": side,
             "entry_price": float(entry_price),
             "primary_sl_price": float(primary_sl_price),

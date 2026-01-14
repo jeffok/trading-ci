@@ -28,7 +28,18 @@
             "IDEMPOTENCY_CONFLICT",
             "POSITION_MUTEX_BLOCKED",
             "COOLDOWN_BLOCKED",
-            "MAX_POSITIONS_BLOCKED"
+            "MAX_POSITIONS_BLOCKED",
+            "CONSISTENCY_DRIFT",
+            "SIGNAL_EXPIRED",
+            "ORDER_TIMEOUT",
+            "ORDER_PARTIAL_FILL",
+            "MARKET_STATE",
+            "ORDER_RETRY",
+            "ORDER_FALLBACK_MARKET",
+            "ORDER_CANCELLED",
+            "BAR_DUPLICATE",
+            "PRICE_JUMP",
+            "VOLUME_ANOMALY"
           ]
         },
         "severity": {

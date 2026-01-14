@@ -29,8 +29,7 @@ def _bybit() -> BybitV5Client:
     )
 
 
-def _equity_usdt(client: BybitV5Client) -> float:
-    resp = client.wallet_balance(account_type=settings.bybit_account_type, coin="USDT")
+def _equity_usdt_from_wallet_balance(resp: dict) -> float:
     res = resp.get("result", {}) or {}
     lst = res.get("list", []) or []
     if not lst:
@@ -61,7 +60,25 @@ def run_risk_monitor_once(database_url: str, redis_url: str) -> None:
         return  # 熔断关闭：不更新、不触发 soft/hard
 
     client = _bybit()
-    eq = _equity_usdt(client)
+    wb = client.wallet_balance_cached(account_type=settings.bybit_account_type, coin="USDT")
+    if wb.get("_degraded"):
+        ev = build_risk_event(
+            typ="RATE_LIMIT",
+            severity="IMPORTANT",
+            symbol=None,
+            detail={"context": "risk_monitor.wallet_balance_cached", "predicted_wait_ms": wb.get("_predicted_wait_ms"), "stale_ms": wb.get("_stale_ms")},
+        )
+        publish_risk_event(redis_url, ev)
+        insert_risk_event(
+            database_url,
+            event_id=new_event_id(),
+            trade_date=trade_date,
+            ts_ms=now_ms(),
+            typ="RATE_LIMIT",
+            severity="IMPORTANT",
+            detail={"context": "risk_monitor.wallet_balance_cached", "predicted_wait_ms": wb.get("_predicted_wait_ms"), "stale_ms": wb.get("_stale_ms")},
+        )
+    eq = _equity_usdt_from_wallet_balance(wb)
 
     starting = st["starting_equity"] if st["starting_equity"] is not None else eq
     min_eq = st["min_equity"] if st["min_equity"] is not None else eq
