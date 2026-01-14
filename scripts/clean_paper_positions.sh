@@ -70,7 +70,7 @@ run_sql() {
     fi
 }
 
-# 查询 PAPER 持仓
+# 查询 PAPER 持仓（更宽松的条件）
 print_info "查询 PAPER 模式留下的持仓..."
 PAPER_POSITIONS=$(run_sql "
 SELECT 
@@ -82,8 +82,13 @@ SELECT
     status, 
     created_at 
 FROM positions 
-WHERE (position_id LIKE 'paper-%' OR idempotency_key LIKE 'paper-%' OR idempotency_key LIKE 'idem-%')
-AND status = 'OPEN'
+WHERE status = 'OPEN'
+AND (
+    position_id LIKE 'paper-%' 
+    OR idempotency_key LIKE 'paper-%' 
+    OR idempotency_key LIKE 'idem-%'
+    OR position_id LIKE 'paper-%'
+)
 ORDER BY created_at DESC;
 " | grep -v "^$" | tail -n +3)
 
@@ -104,32 +109,47 @@ if [ "$confirm" != "yes" ] && [ "$confirm" != "y" ]; then
     exit 0
 fi
 
-# 清理持仓
+# 清理持仓（更宽松的条件）
 print_info "开始清理..."
-run_sql "
+RESULT=$(run_sql "
 UPDATE positions 
 SET 
     status = 'CLOSED',
     updated_at = now(),
     closed_at_ms = extract(epoch from now())::bigint * 1000,
     exit_reason = 'PAPER_POSITION_CLEANUP'
-WHERE (position_id LIKE 'paper-%' OR idempotency_key LIKE 'paper-%' OR idempotency_key LIKE 'idem-%')
-AND status = 'OPEN';
-" > /dev/null 2>&1
+WHERE status = 'OPEN'
+AND (
+    position_id LIKE 'paper-%' 
+    OR idempotency_key LIKE 'paper-%' 
+    OR idempotency_key LIKE 'idem-%'
+)
+RETURNING position_id;
+" | grep -v "^$" | tail -n +3)
 
-if [ $? -eq 0 ]; then
-    print_success "完成！已清理 PAPER 模式持仓"
-    
-    # 验证
+if [ -n "$RESULT" ]; then
+    print_info "已清理的持仓："
+    echo "$RESULT"
+fi
+
+# 验证
+echo ""
+print_info "验证清理结果..."
+REMAINING=$(run_sql "SELECT COUNT(*) FROM positions WHERE status='OPEN';" | grep -oE "[0-9]+" | head -1)
+if [ "$REMAINING" = "0" ]; then
+    print_success "所有 OPEN 持仓已清理"
+elif [ -n "$RESULT" ]; then
+    print_success "已清理 PAPER 模式持仓"
+    print_warning "仍有 $REMAINING 个 OPEN 持仓（可能不是 PAPER 模式）"
     echo ""
-    print_info "验证清理结果..."
-    REMAINING=$(run_sql "SELECT COUNT(*) FROM positions WHERE status='OPEN' AND (position_id LIKE 'paper-%' OR idempotency_key LIKE 'paper-%');" | grep -oE "[0-9]+" | head -1)
-    if [ "$REMAINING" = "0" ]; then
-        print_success "所有 PAPER 持仓已清理"
-    else
-        print_warning "仍有 $REMAINING 个 PAPER 持仓"
-    fi
+    print_info "查看剩余持仓："
+    run_sql "SELECT position_id, idempotency_key, symbol, side, qty_total FROM positions WHERE status='OPEN';" | grep -v "^$" | tail -n +3
+    echo ""
+    print_info "如需清理所有 OPEN 持仓，请运行: ./scripts/force_close_position.sh all"
 else
-    print_error "清理失败"
-    exit 1
+    print_warning "没有找到匹配的 PAPER 持仓"
+    print_info "查看所有 OPEN 持仓："
+    run_sql "SELECT position_id, idempotency_key, symbol, side, qty_total FROM positions WHERE status='OPEN';" | grep -v "^$" | tail -n +3
+    echo ""
+    print_info "如需强制关闭，请运行: ./scripts/force_close_position.sh all"
 fi
