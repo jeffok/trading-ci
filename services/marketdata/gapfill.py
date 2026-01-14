@@ -38,14 +38,14 @@ def _calc_close_time_ms(tf: str, start_ms: int) -> int:
     return int(start_ms) + timeframe_ms(tf) - 1
 
 
-def _publish_bar_close_idempotent(*, database_url: str, redis_url: str, symbol: str, timeframe: str, close_time_ms: int, source: str) -> None:
+def _publish_bar_close_idempotent(*, database_url: str, redis_url: str, symbol: str, timeframe: str, close_time_ms: int, source: str, ohlcv: Dict[str, Any]) -> None:
     """幂等发布 bar_close：预留 bar_close_emits 成功才发布。"""
     eid = new_event_id()
     ok = reserve_bar_close_emit(database_url, symbol=symbol, timeframe=timeframe, close_time_ms=close_time_ms, event_id=eid, source=source)
     if not ok:
         return
     try:
-        ev = build_bar_close_event(symbol=symbol, timeframe=timeframe, close_time_ms=close_time_ms, source=source, trace_id=None)
+        ev = build_bar_close_event(symbol=symbol, timeframe=timeframe, close_time_ms=close_time_ms, source=source, ohlcv=ohlcv, trace_id=None)
         publish_bar_close(redis_url, ev)
     except Exception:
         rollback_bar_close_emit(database_url, symbol=symbol, timeframe=timeframe, close_time_ms=close_time_ms, event_id=eid)
@@ -166,6 +166,13 @@ def handle_confirmed_candle(*, database_url: str, redis_url: str, symbol: str, t
                     timeframe=timeframe,
                     close_time_ms=ct,
                     source="bybit_rest_gapfill",
+                    ohlcv={
+                        "open": float(c["open"]),
+                        "high": float(c["high"]),
+                        "low": float(c["low"]),
+                        "close": float(c["close"]),
+                        "volume": float(c["volume"]),
+                    },
                 )
 
             _emit_risk(
@@ -199,4 +206,11 @@ def handle_confirmed_candle(*, database_url: str, redis_url: str, symbol: str, t
         timeframe=timeframe,
         close_time_ms=close_ms,
         source=source,
+        ohlcv={
+            "open": float(candle["open"]),
+            "high": float(candle["high"]),
+            "low": float(candle["low"]),
+            "close": float(candle["close"]),
+            "volume": float(candle["volume"]),
+        },
     )

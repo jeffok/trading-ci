@@ -1680,7 +1680,13 @@ def cmd_replay(args):
             timeframe=tf,
             close_time_ms=int(b["close_time_ms"]),
             source="REPLAY",
-            ohlcv=[float(b["open"]), float(b["high"]), float(b["low"]), float(b["close"]), float(b["volume"])],
+            ohlcv={
+                "open": float(b["open"]),
+                "high": float(b["high"]),
+                "low": float(b["low"]),
+                "close": float(b["close"]),
+                "volume": float(b["volume"]),
+            },
         )
         evt["payload"]["ext"] = {"run_id": run_id, "seq": i}
         publish_event(client, "stream:bar_close", evt, event_type="bar_close")
