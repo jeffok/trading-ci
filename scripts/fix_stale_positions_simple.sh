@@ -103,12 +103,20 @@ USE_DOCKER=false
 if ! command -v psql > /dev/null 2>&1; then
     print_warning "未找到 psql 命令，将使用 Docker 容器"
     USE_DOCKER=true
+elif [ -z "$DB_URL" ]; then
+    print_error "无法获取数据库连接信息"
+    exit 1
 else
     # 测试 psql 版本是否支持 SCRAM（尝试连接，如果失败则使用 Docker）
     if ! psql "$DB_URL" -c "SELECT 1;" > /dev/null 2>&1; then
-        ERROR_MSG=$(psql "$DB_URL" -c "SELECT 1;" 2>&1)
+        ERROR_MSG=$(psql "$DB_URL" -c "SELECT 1;" 2>&1 || true)
         if echo "$ERROR_MSG" | grep -q "SCRAM authentication requires libpq version 10"; then
             print_warning "本地 psql 版本过旧，不支持 SCRAM 认证"
+            print_info "将使用 Docker 容器执行数据库操作"
+            USE_DOCKER=true
+        else
+            # 其他错误，也尝试使用 Docker
+            print_warning "本地 psql 连接失败: ${ERROR_MSG:0:100}"
             print_info "将使用 Docker 容器执行数据库操作"
             USE_DOCKER=true
         fi
