@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-# 颜色定义
+# 颜色定义k
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
