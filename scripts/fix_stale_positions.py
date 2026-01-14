@@ -6,6 +6,13 @@
 - 查询数据库中的 OPEN 持仓
 - 与 Bybit 交易所实际持仓对比
 - 清理无效的持仓记录（交易所中已不存在的持仓）
+
+使用方法：
+  在 Docker 容器中运行：
+    docker compose exec execution python -m scripts.fix_stale_positions --dry-run
+  
+  或直接运行（需要安装依赖）：
+    python -m scripts.fix_stale_positions --dry-run
 """
 
 from __future__ import annotations
@@ -16,12 +23,23 @@ import sys
 from typing import List, Dict, Any
 
 # 添加项目根目录到路径
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
 
-from libs.common.config import settings
-from libs.common.time import now_ms
-from libs.db.pg import get_conn
-from libs.bybit.trade_rest_v5 import BybitV5Client
+try:
+    from libs.common.config import settings
+    from libs.common.time import now_ms
+    from libs.db.pg import get_conn
+    from libs.bybit.trade_rest_v5 import BybitV5Client
+except ImportError as e:
+    print(f"❌ 导入错误: {e}")
+    print("\n💡 提示：")
+    print("   1. 在 Docker 容器中运行：")
+    print("      docker compose exec execution python -m scripts.fix_stale_positions --dry-run")
+    print("\n   2. 或安装依赖后运行：")
+    print("      pip install -r requirements.txt")
+    print("      python -m scripts.fix_stale_positions --dry-run")
+    sys.exit(1)
 
 
 def list_open_positions_db(database_url: str) -> List[Dict[str, Any]]:

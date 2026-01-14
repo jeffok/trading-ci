@@ -53,19 +53,59 @@ async def run_position_sync_loop() -> None:
 
 ## 🔧 解决方案
 
-### 方案1：使用修复脚本（推荐）
+### 方案1：使用 Shell 脚本（推荐，最简单）
 
-我已经创建了修复脚本 `scripts/fix_stale_positions.py`：
+我已经创建了 Shell 脚本版本，不需要 Python 依赖：
 
 ```bash
 # 1. 查看数据库中的 OPEN 持仓（不修改）
+./scripts/fix_stale_positions_simple.sh --dry-run
+
+# 2. 清理所有 OPEN 持仓（谨慎使用）
+./scripts/fix_stale_positions_simple.sh --force
+
+# 3. 只清理特定交易对的持仓
+./scripts/fix_stale_positions_simple.sh --symbol BTCUSDT
+
+# 在 Docker 容器中运行：
+docker compose exec execution bash scripts/fix_stale_positions_simple.sh --dry-run
+```
+
+### 方案2：使用 SQL 脚本（直接操作数据库）
+
+```bash
+# 1. 查看 OPEN 持仓
+psql -U postgres -d trading-ci -f scripts/fix_stale_positions.sql
+
+# 2. 清理所有 OPEN 持仓
+psql -U postgres -d trading-ci -c "
+UPDATE positions 
+SET status='CLOSED', 
+    updated_at=now(), 
+    closed_at_ms=extract(epoch from now())::bigint * 1000,
+    exit_reason='MANUAL_CLEANUP' 
+WHERE status='OPEN';"
+
+# 3. 只清理特定交易对
+psql -U postgres -d trading-ci -c "
+UPDATE positions 
+SET status='CLOSED', 
+    updated_at=now(), 
+    closed_at_ms=extract(epoch from now())::bigint * 1000,
+    exit_reason='MANUAL_CLEANUP' 
+WHERE status='OPEN' AND symbol='BTCUSDT';"
+```
+
+### 方案3：使用 Python 脚本（在 Docker 容器中）
+
+```bash
+# 在 Docker 容器中运行（推荐）
+docker compose exec execution python -m scripts.fix_stale_positions --dry-run
+docker compose exec execution python -m scripts.fix_stale_positions --force
+
+# 或本地运行（需要安装依赖）
+pip install -r requirements.txt
 python -m scripts.fix_stale_positions --dry-run
-
-# 2. 检查 Bybit 实际持仓并清理无效持仓（LIVE 模式）
-python -m scripts.fix_stale_positions --check-bybit
-
-# 3. 强制清理所有 OPEN 持仓（谨慎使用）
-python -m scripts.fix_stale_positions --force
 ```
 
 ### 方案2：手动查询和清理
