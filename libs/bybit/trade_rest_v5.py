@@ -396,6 +396,55 @@ class TradeRestV5Client:
             body["trailingStop"] = trailing_stop
         return self._request_private("POST", "/v5/position/trading-stop", body=body)
 
+    def set_leverage(self, *, category: str, symbol: str, leverage: int, buy_leverage: Optional[int] = None, sell_leverage: Optional[int] = None) -> Dict[str, Any]:
+        """
+        设置杠杆倍数
+        
+        Args:
+            category: 合约类型（linear）
+            symbol: 交易对
+            leverage: 杠杆倍数（1-125）
+            buy_leverage: 买入杠杆（可选，默认使用 leverage）
+            sell_leverage: 卖出杠杆（可选，默认使用 leverage）
+        """
+        body: Dict[str, Any] = {
+            "category": category,
+            "symbol": symbol,
+            "buyLeverage": str(buy_leverage if buy_leverage is not None else leverage),
+            "sellLeverage": str(sell_leverage if sell_leverage is not None else leverage),
+        }
+        return self._request_private("POST", "/v5/position/set-leverage", body=body)
+
+    def set_margin_mode(self, *, category: str, symbol: str, margin_mode: str, leverage: Optional[int] = None) -> Dict[str, Any]:
+        """
+        设置保证金模式
+        
+        Args:
+            category: 合约类型（linear）
+            symbol: 交易对
+            margin_mode: "ISOLATED"（逐仓）或 "REGULAR_MARGIN"（全仓）
+            leverage: 杠杆倍数（逐仓模式必填，全仓模式设为 0）
+        """
+        if margin_mode.upper() == "ISOLATED":
+            # 逐仓模式需要设置杠杆
+            if leverage is None or leverage <= 0:
+                raise ValueError("逐仓模式必须设置杠杆倍数")
+            body: Dict[str, Any] = {
+                "category": category,
+                "symbol": symbol,
+                "buyLeverage": str(leverage),
+                "sellLeverage": str(leverage),
+            }
+        else:
+            # 全仓模式（REGULAR_MARGIN）
+            body: Dict[str, Any] = {
+                "category": category,
+                "symbol": symbol,
+                "buyLeverage": "0",
+                "sellLeverage": "0",
+            }
+        return self._request_private("POST", "/v5/position/set-leverage", body=body)
+
     # -------------------- Stage 4: cached private query endpoints --------------------
     def wallet_balance_cached(self, *, account_type: str, coin: Optional[str] = None) -> Dict[str, Any]:
         ttl = float(getattr(settings, "bybit_wallet_balance_cache_ttl_sec", 1.0))

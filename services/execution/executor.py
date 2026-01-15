@@ -470,14 +470,74 @@ def execute_trade_plan(database_url: str, redis_url: str, *, trade_plan_event: D
         filters = _parse_instrument_filters(symbol)
         equity = _equity_usdt()
 
-        qty_total = calc_qty(equity=equity, risk_pct=risk_pct, entry=entry, stop=sl, filters=filters)
+        # 使用新的仓位计算方式（考虑实际价值和合约倍数）
+        leverage = int(getattr(settings, "leverage", 1))
+        min_order_value = float(getattr(settings, "min_order_value_usdt", 10.0))
+        max_order_value = float(getattr(settings, "max_order_value_usdt", 10000.0))
+        
+        from libs.execution.risk import calc_qty_with_value_control
+        qty_total, order_value_usdt = calc_qty_with_value_control(
+            equity=equity,
+            risk_pct=risk_pct,
+            entry=entry,
+            stop=sl,
+            leverage=leverage,
+            min_order_value_usdt=min_order_value,
+            max_order_value_usdt=max_order_value,
+            filters=filters,
+        )
+        
         if qty_total <= 0:
             rep = build_execution_report(
                 idempotency_key=idem,
                 symbol=symbol,
                 typ="ERROR",
                 severity="IMPORTANT",
-                detail={"error": "qty_total<=0", "equity": equity, "risk_pct": risk_pct, "entry": entry, "sl": sl},
+                detail={
+                    "error": "qty_total<=0",
+                    "equity": equity,
+                    "risk_pct": risk_pct,
+                    "entry": entry,
+                    "sl": sl,
+                    "leverage": leverage,
+                    "min_order_value_usdt": min_order_value,
+                    "max_order_value_usdt": max_order_value,
+                },
+                ext={"run_id": run_id} if run_id else None,
+                trace_id=trade_plan_event.get("trace_id"),
+            )
+            publish_execution_report(redis_url, rep)
+            return
+        
+        # 检查实际下单金额是否在范围内（二次验证）
+        if order_value_usdt < min_order_value:
+            rep = build_execution_report(
+                idempotency_key=idem,
+                symbol=symbol,
+                typ="REJECTED",
+                severity="IMPORTANT",
+                detail={
+                    "reason": "ORDER_VALUE_TOO_SMALL",
+                    "order_value_usdt": order_value_usdt,
+                    "min_order_value_usdt": min_order_value,
+                },
+                ext={"run_id": run_id} if run_id else None,
+                trace_id=trade_plan_event.get("trace_id"),
+            )
+            publish_execution_report(redis_url, rep)
+            return
+        
+        if order_value_usdt > max_order_value:
+            rep = build_execution_report(
+                idempotency_key=idem,
+                symbol=symbol,
+                typ="REJECTED",
+                severity="IMPORTANT",
+                detail={
+                    "reason": "ORDER_VALUE_TOO_LARGE",
+                    "order_value_usdt": order_value_usdt,
+                    "max_order_value_usdt": max_order_value,
+                },
                 ext={"run_id": run_id} if run_id else None,
                 trace_id=trade_plan_event.get("trace_id"),
             )
@@ -512,6 +572,9 @@ def execute_trade_plan(database_url: str, redis_url: str, *, trade_plan_event: D
                 "tp1_filled": False,
                 "tp2_filled": False,
                 "mode": settings.execution_mode,
+                "leverage": leverage,
+                "order_value_usdt": order_value_usdt,
+                "margin_mode": str(getattr(settings, "margin_mode", "isolated")),
             },
         )
 

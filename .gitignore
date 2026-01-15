@@ -1,7 +1,8 @@
 .idea
 *.idea
 .env
-*.env
+# 注意：.env.example 应该被提交到版本控制
+!.env.example
 *.venv
 
 # Python 缓存文件

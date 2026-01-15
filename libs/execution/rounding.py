@@ -28,3 +28,12 @@ def round_to_tick(price: float, tick: float) -> float:
 
 def clamp_min(x: float, min_value: float) -> float:
     return x if x >= min_value else 0.0
+
+
+def clamp(x: float, min_value: float, max_value: float) -> float:
+    """限制值在 [min_value, max_value] 范围内"""
+    if x < min_value:
+        return min_value
+    if x > max_value:
+        return max_value
+    return x

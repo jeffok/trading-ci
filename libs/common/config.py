@@ -104,6 +104,16 @@ class Settings(BaseModel):
     bybit_account_type: str = Field(default="UNIFIED", alias="BYBIT_ACCOUNT_TYPE")
     bybit_category: str = Field(default="linear", alias="BYBIT_CATEGORY")
     bybit_position_idx: int = Field(default=0, alias="BYBIT_POSITION_IDX")
+    
+    # 仓位控制（实际价值）
+    min_order_value_usdt: float = Field(default=10.0, alias="MIN_ORDER_VALUE_USDT")
+    max_order_value_usdt: float = Field(default=10000.0, alias="MAX_ORDER_VALUE_USDT")
+    
+    # 合约倍数
+    leverage: int = Field(default=1, alias="LEVERAGE")
+    
+    # 保证金模式（isolated=逐仓，cross=全仓）
+    margin_mode: str = Field(default="isolated", alias="MARGIN_MODE")
 
 
     # Stage 4: Bybit REST rate limiting (single-instance)

@@ -18,6 +18,7 @@ marketdata-service 主工作流（Phase 1）
 from __future__ import annotations
 
 import asyncio
+import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from libs.common.config import settings
@@ -46,6 +47,12 @@ from services.marketdata.market_state import MarketStateTracker
 
 
 logger = setup_logging("marketdata-service")
+
+
+def _trade_date_from_ts_ms(ts_ms: int) -> str:
+    """从时间戳（毫秒）计算交易日期（UTC）。"""
+    dt = datetime.datetime.utcfromtimestamp(ts_ms / 1000.0)
+    return dt.date().isoformat()
 
 
 def _topics(symbols: List[str], timeframes: List[str]) -> List[str]:
@@ -233,7 +240,7 @@ async def run_marketdata() -> None:
             for fd in findings:
                 evq = build_risk_event(typ=fd.typ, severity=fd.severity, symbol=symbol, detail={**fd.detail, "timeframe": tf, "close_time_ms": k["end_ms"], "source": "marketdata"})
                 publish_risk_event(settings.redis_url, evq)
-                insert_risk_event(settings.database_url, event_id=evq["event_id"], trade_date=evq["trade_date"], ts_ms=evq["ts_ms"], typ=fd.typ, severity=fd.severity, detail=evq["payload"]["detail"], symbol=symbol)
+                insert_risk_event(settings.database_url, event_id=evq["event_id"], trade_date=_trade_date_from_ts_ms(evq["ts_ms"]), ts_ms=evq["ts_ms"], typ=fd.typ, severity=fd.severity, detail=evq["payload"]["detail"], symbol=symbol)
 
         # 6) market state marker（不影响交易，仅告警）
         if bool(getattr(settings, "market_state_enabled", False)):
@@ -255,7 +262,7 @@ async def run_marketdata() -> None:
                     },
                 )
                 publish_risk_event(settings.redis_url, evm)
-                insert_risk_event(settings.database_url, event_id=evm["event_id"], trade_date=evm["trade_date"], ts_ms=evm["ts_ms"], typ="MARKET_STATE", severity=sev, detail=evm["payload"]["detail"], symbol=symbol)
+                insert_risk_event(settings.database_url, event_id=evm["event_id"], trade_date=_trade_date_from_ts_ms(evm["ts_ms"]), ts_ms=evm["ts_ms"], typ="MARKET_STATE", severity=sev, detail=evm["payload"]["detail"], symbol=symbol)
 
         # Stage 8: market state marker (observability only)
         if bool(getattr(settings, "market_state_enabled", False)):

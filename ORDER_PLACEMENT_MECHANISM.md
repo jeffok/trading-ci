@@ -232,7 +232,111 @@ COOLDOWN_ENABLED=true
 
 # 风险百分比
 RISK_PCT=0.005
+
+# ========== 仓位控制（实际价值） ==========
+# 最低下单金额（USDT）
+MIN_ORDER_VALUE_USDT=10.0
+
+# 最高下单金额（USDT）
+MAX_ORDER_VALUE_USDT=10000.0
+
+# 合约倍数（1-125）
+LEVERAGE=1
+
+# 保证金模式（isolated=逐仓，cross=全仓）
+MARGIN_MODE=isolated
 ```
+
+---
+
+## 💰 仓位控制与资金管理
+
+### 仓位计算方式
+
+系统使用**实际价值（USDT）**来计算仓位，而不是简单的合约数量。
+
+**计算公式**：
+```
+1. 风险金额 = equity * risk_pct
+2. 单位风险 = abs(entry - stop)
+3. 合约数量 = 风险金额 / 单位风险
+4. 实际下单金额 = (合约数量 * 入场价格) / 杠杆倍数
+5. 应用最低/最高金额限制
+6. 取整和最小值校验
+```
+
+**实际价值说明**：
+- 实际价值 = (合约数量 * 入场价格) / 杠杆倍数
+- 这是实际占用的保证金金额，不是合约名义价值
+- 例如：0.1 BTC @ 50000 USDT，10倍杠杆 = (0.1 * 50000) / 10 = 500 USDT
+
+### 金额限制
+
+系统会自动应用最低/最高金额限制：
+
+- **低于最低金额**：自动调整为 `MIN_ORDER_VALUE_USDT`
+- **超过最高金额**：自动调整为 `MAX_ORDER_VALUE_USDT`
+- **调整后仍不符合要求**：拒绝订单并发送错误报告
+
+### 逐仓 vs 全仓模式
+
+- **逐仓（isolated）**：
+  - 每个持仓独立保证金
+  - 风险隔离，推荐使用
+  - 需要设置杠杆倍数
+
+- **全仓（cross）**：
+  - 所有持仓共享保证金
+  - 风险更高，不推荐
+  - 杠杆倍数设为 0
+
+系统会在下单前自动设置逐仓/全仓模式和杠杆倍数。
+
+### 杠杆倍数
+
+- **杠杆越高**：所需保证金越少，但风险越大
+- **建议设置**：1-10倍（较安全）
+- **最大支持**：125倍（Bybit 限制）
+
+### 计算示例
+
+#### 示例1：逐仓模式，10倍杠杆
+
+**输入**：
+- equity = 10000 USDT
+- risk_pct = 0.005 (0.5%)
+- entry = 50000 USDT
+- stop = 49000 USDT
+- leverage = 10
+- min_order_value_usdt = 10 USDT
+- max_order_value_usdt = 1000 USDT
+
+**计算**：
+1. 风险金额 = 10000 * 0.005 = 50 USDT
+2. 单位风险 = |50000 - 49000| = 1000 USDT
+3. 合约数量 = 50 / 1000 = 0.05 BTC
+4. 实际下单金额 = (0.05 * 50000) / 10 = 250 USDT
+5. ✅ 在范围内（10 ≤ 250 ≤ 1000）
+
+#### 示例2：低于最低金额
+
+**输入**：
+- 计算出的 order_value_usdt = 5 USDT
+- min_order_value_usdt = 10 USDT
+
+**处理**：
+- 自动调整为 10 USDT
+- 重新计算 qty = (10 * 10) / 50000 = 0.002 BTC
+
+#### 示例3：超过最高金额
+
+**输入**：
+- 计算出的 order_value_usdt = 2000 USDT
+- max_order_value_usdt = 1000 USDT
+
+**处理**：
+- 自动调整为 1000 USDT
+- 重新计算 qty = (1000 * 10) / 50000 = 0.2 BTC
 
 ---
 
@@ -287,5 +391,6 @@ RISK_PCT=0.005
 
 - [STOP_LOSS_TAKE_PROFIT_RULES.md](./STOP_LOSS_TAKE_PROFIT_RULES.md) - 止损/止盈规则
 - [SYNC_MECHANISM.md](./SYNC_MECHANISM.md) - 订单与持仓同步机制
+- [TELEGRAM_NOTIFICATIONS.md](./TELEGRAM_NOTIFICATIONS.md) - Telegram 通知说明
 - [services/strategy/README.md](./services/strategy/README.md) - 策略服务说明
 - [services/execution/README.md](./services/execution/README.md) - 执行服务说明

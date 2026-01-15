@@ -68,6 +68,19 @@ RISK_CIRCUIT_ENABLED=true
 DAILY_DRAWDOWN_SOFT_PCT=0.01
 DAILY_DRAWDOWN_HARD_PCT=0.02
 
+# ========== 仓位控制（实际价值） ==========
+# 最低下单金额（USDT）
+MIN_ORDER_VALUE_USDT=10.0
+
+# 最高下单金额（USDT）
+MAX_ORDER_VALUE_USDT=1000.0
+
+# 合约倍数（1-125）
+LEVERAGE=10
+
+# 保证金模式（isolated=逐仓，cross=全仓）
+MARGIN_MODE=isolated
+
 # ========== 其他重要配置 ==========
 # 管理员令牌（用于紧急停止）
 ADMIN_TOKEN=your_strong_admin_token
