@@ -97,7 +97,7 @@ def _parse_kline_msg(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def _system_tf_from_topic(topic: str) -> Tuple[str, str]:
     _, interval, symbol = topic.split(".", 2)
-    interval_to_tf = {"15": "15m", "30": "30m", "60": "1h", "240": "4h", "D": "1d"}
+    interval_to_tf = {"1": "1m", "5": "5m", "15": "15m", "30": "30m", "60": "1h", "240": "4h", "D": "1d"}
     return interval_to_tf.get(interval, interval), symbol
 
 
