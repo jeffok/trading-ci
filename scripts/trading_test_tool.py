@@ -1036,6 +1036,16 @@ def cmd_diagnose(args):
     """诊断下单失败命令"""
     diagnose_order_failure(args.symbol, args.side)
 
+def cmd_diagnose_signals(args):
+    """诊断信号生成问题命令"""
+    import subprocess
+    import sys
+    
+    # 调用独立的诊断脚本
+    script_path = Path(__file__).parent / "diagnose_signals.py"
+    cmd = [sys.executable, str(script_path), "--symbol", args.symbol, "--timeframe", args.timeframe]
+    subprocess.run(cmd)
+
 # ==================== 持仓同步功能 ====================
 
 def sync_positions_with_exchange(dry_run: bool = False) -> Dict[str, Any]:
@@ -2546,6 +2556,11 @@ def main():
     diagnose_parser.add_argument('--symbol', required=True, help='交易对，如 BTCUSDT')
     diagnose_parser.add_argument('--side', required=True, choices=['BUY', 'SELL'], help='方向：BUY 或 SELL')
     
+    # diagnose-signals 命令
+    diagnose_signals_parser = subparsers.add_parser('diagnose-signals', help='诊断信号生成问题')
+    diagnose_signals_parser.add_argument('--symbol', default='BTCUSDT', help='交易对（默认: BTCUSDT）')
+    diagnose_signals_parser.add_argument('--timeframe', default='1h', help='时间框架（默认: 1h）')
+    
     # sync 命令
     sync_parser = subparsers.add_parser('sync', help='同步数据库持仓与交易所持仓')
     sync_parser.add_argument('--dry-run', action='store_true', help='仅检查，不实际修改数据库')
@@ -2632,6 +2647,8 @@ def main():
         cmd_orders(args)
     elif args.command == 'diagnose':
         cmd_diagnose(args)
+    elif args.command == 'diagnose-signals':
+        cmd_diagnose_signals(args)
     elif args.command == 'sync':
         cmd_sync(args)
     elif args.command == 'close-test':
