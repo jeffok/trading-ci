@@ -23,7 +23,7 @@ try:
     from libs.common.config import settings
     from libs.common.time import now_ms
     from libs.db.pg import get_conn
-    from libs.bybit.market_rest import BybitMarketRestClient, MarketRestV5Client
+    from libs.bybit.market_rest import BybitMarketRestClient
     from libs.bybit.trade_rest_v5 import TradeRestV5Client
 except ImportError as e:
     print(f"❌ 导入错误: {e}")
@@ -1038,13 +1038,220 @@ def cmd_diagnose(args):
 
 def cmd_diagnose_signals(args):
     """诊断信号生成问题命令"""
-    import subprocess
-    import sys
+    # 直接在这里实现诊断逻辑，避免导入问题
+    from libs.strategy.repo import get_bars
+    from libs.strategy.divergence import detect_three_segment_divergence
+    from libs.strategy.confluence import Candle, vegas_state, engulfing, rsi_divergence, obv_divergence, fvg_proximity
     
-    # 调用独立的诊断脚本
-    script_path = Path(__file__).parent / "diagnose_signals.py"
-    cmd = [sys.executable, str(script_path), "--symbol", args.symbol, "--timeframe", args.timeframe]
-    subprocess.run(cmd)
+    symbol = args.symbol.upper()
+    timeframe = args.timeframe
+    
+    print("\n" + "=" * 80)
+    print("  信号生成诊断工具".center(80))
+    print("=" * 80)
+    
+    # 1. 检查市场数据
+    print("\n" + "=" * 80)
+    print("  1. 市场数据检查")
+    print("=" * 80)
+    
+    bars = get_bars(settings.database_url, symbol=symbol, timeframe=timeframe, limit=500)
+    bar_count = len(bars)
+    
+    print_info(f"交易对: {symbol}, 时间框架: {timeframe}")
+    print_info(f"K 线数量: {bar_count}")
+    
+    if bar_count < 120:
+        print_error(f"K 线数量不足！需要至少 120 根，当前只有 {bar_count} 根")
+        print_warning("信号生成需要至少 120 根 K 线才能进行三段背离检测")
+        return
+    
+    print_success(f"K 线数量足够（{bar_count} >= 120）")
+    
+    if bars:
+        latest = bars[-1]
+        print_info(f"最新 K 线时间: {latest['close_time_ms']}")
+        print_info(f"最新收盘价: {latest['close']}")
+    
+    # 2. 检查三段背离
+    print("\n" + "=" * 80)
+    print("  2. 三段背离检测")
+    print("=" * 80)
+    
+    candles = [Candle(open=b["open"], high=b["high"], low=b["low"], close=b["close"], volume=b["volume"]) for b in bars]
+    close = [c.close for c in candles]
+    high = [c.high for c in candles]
+    low = [c.low for c in candles]
+    
+    setup = detect_three_segment_divergence(close=close, high=high, low=low)
+    
+    if setup is None:
+        print_warning("未检测到三段背离")
+        print_info("三段背离是信号生成的前提条件")
+        print_info("需要 MACD histogram 形成三段顶/底背离结构")
+        return
+    
+    print_success(f"检测到三段背离！方向: {setup.direction}")
+    print_info(f"  P1: index={setup.p1.index}, price={setup.p1.price:.2f}, hist={setup.h1:.4f}")
+    print_info(f"  P2: index={setup.p2.index}, price={setup.p2.price:.2f}, hist={setup.h2:.4f}")
+    print_info(f"  P3: index={setup.p3.index}, price={setup.p3.price:.2f}, hist={setup.h3:.4f}")
+    
+    bias = setup.direction
+    
+    # 3. 检查 Vegas
+    print("\n" + "=" * 80)
+    print("  3. Vegas 状态检查")
+    print("=" * 80)
+    
+    vs = vegas_state(close)
+    print_info(f"当前 Vegas 状态: {vs}")
+    print_info(f"信号方向: {bias}")
+    
+    if bias == "LONG" and vs != "Bullish":
+        print_error(f"Vegas 状态不匹配！LONG 信号需要 Bullish，但当前是 {vs}")
+        return
+    
+    if bias == "SHORT" and vs != "Bearish":
+        print_error(f"Vegas 状态不匹配！SHORT 信号需要 Bearish，但当前是 {vs}")
+        return
+    
+    print_success(f"Vegas 状态匹配（{bias} 需要 {vs}）")
+    
+    # 4. 检查确认项
+    print("\n" + "=" * 80)
+    print("  4. 确认项检查")
+    print("=" * 80)
+    
+    hits = []
+    
+    if engulfing(candles[-2:], bias):
+        hits.append("ENGULFING")
+        print_success("✅ ENGULFING（吞没形态）")
+    else:
+        print_warning("❌ ENGULFING（吞没形态）未命中")
+    
+    if rsi_divergence(candles, bias):
+        hits.append("RSI_DIV")
+        print_success("✅ RSI_DIV（RSI 背离）")
+    else:
+        print_warning("❌ RSI_DIV（RSI 背离）未命中")
+    
+    if obv_divergence(candles, bias):
+        hits.append("OBV_DIV")
+        print_success("✅ OBV_DIV（OBV 背离）")
+    else:
+        print_warning("❌ OBV_DIV（OBV 背离）未命中")
+    
+    if fvg_proximity(candles, bias):
+        hits.append("FVG_PROXIMITY")
+        print_success("✅ FVG_PROXIMITY（FVG 接近）")
+    else:
+        print_warning("❌ FVG_PROXIMITY（FVG 接近）未命中")
+    
+    print_info(f"\n命中确认项数量: {len(hits)}/{4}")
+    print_info(f"需要的最小确认项: {settings.min_confirmations}")
+    print_info(f"命中的确认项: {hits if hits else '无'}")
+    
+    if len(hits) < settings.min_confirmations:
+        print_error(f"确认项不足！需要至少 {settings.min_confirmations} 个，但只命中 {len(hits)} 个")
+        return
+    
+    print_success(f"确认项足够（{len(hits)} >= {settings.min_confirmations}）")
+    
+    # 5. 检查服务状态
+    print("\n" + "=" * 80)
+    print("  5. 策略服务状态检查")
+    print("=" * 80)
+    
+    try:
+        r = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+        r.ping()
+        print_success("Redis 连接正常")
+    except Exception as e:
+        print_error(f"Redis 连接失败: {e}")
+        return
+    
+    # 检查 bar_close 事件
+    try:
+        msgs = r.xrevrange("stream:bar_close", "+", "-", count=5)
+        if msgs:
+            print_success(f"最近有 {len(msgs)} 个 bar_close 事件")
+        else:
+            print_warning("没有 bar_close 事件！")
+            print_warning("可能原因：")
+            print_warning("  1. marketdata 服务未运行")
+            print_warning("  2. 没有订阅的交易对")
+            print_warning("  3. 市场数据未正常接收")
+    except Exception as e:
+        print_warning(f"检查 bar_close 事件失败: {e}")
+    
+    # 检查信号事件
+    try:
+        msgs = r.xrevrange("stream:signal", "+", "-", count=5)
+        if msgs:
+            print_warning(f"最近有 {len(msgs)} 个信号事件（说明之前有信号生成）")
+        else:
+            print_info("没有信号事件（这是正常的，如果当前没有符合条件的信号）")
+    except Exception as e:
+        print_warning(f"检查信号事件失败: {e}")
+    
+    # 6. 检查数据库信号
+    print("\n" + "=" * 80)
+    print("  6. 数据库信号检查")
+    print("=" * 80)
+    
+    try:
+        with get_conn(settings.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT signal_id, symbol, timeframe, bias, hit_count, hits, vegas_state, created_at
+                    FROM signals
+                    WHERE symbol = %s AND timeframe = %s
+                    ORDER BY created_at DESC
+                    LIMIT 10
+                """, (symbol, timeframe))
+                
+                rows = cur.fetchall()
+                
+                if rows:
+                    print_success(f"找到 {len(rows)} 个历史信号")
+                    print_info("\n最近的信号：")
+                    for i, row in enumerate(rows[:5], 1):
+                        print(f"  {i}. {row[3]} | hits={row[4]} | {row[6]} | {row[7]}")
+                else:
+                    print_warning(f"数据库中没有 {symbol} {timeframe} 的信号记录")
+    except Exception as e:
+        print_error(f"查询数据库失败: {e}")
+    
+    # 7. 检查配置
+    print("\n" + "=" * 80)
+    print("  7. 配置检查")
+    print("=" * 80)
+    
+    print_info(f"MIN_CONFIRMATIONS: {settings.min_confirmations}")
+    print_info(f"AUTO_TIMEFRAMES: {settings.auto_timeframes}")
+    print_info(f"MONITOR_TIMEFRAMES: {settings.monitor_timeframes}")
+    
+    auto_tfs = [x.strip() for x in settings.auto_timeframes.split(",") if x.strip()]
+    monitor_tfs = [x.strip() for x in settings.monitor_timeframes.split(",") if x.strip()]
+    
+    print_info(f"\n自动下单时间框架: {auto_tfs}")
+    print_info(f"监控时间框架: {monitor_tfs}")
+    print_info("注意：只有 AUTO_TIMEFRAMES 中的时间框架会生成 trade_plan")
+    
+    # 总结
+    print("\n" + "=" * 80)
+    print("  诊断总结".center(80))
+    print("=" * 80)
+    print_success("所有条件都满足，应该可以生成信号！")
+    print_info("如果仍然没有信号，可能的原因：")
+    print_info("  1. 策略服务未正常运行")
+    print_info("  2. bar_close 事件未正常接收")
+    print_info("  3. 信号已生成但被其他条件过滤")
+    print_info("\n建议：")
+    print_info("  1. 检查策略服务日志: docker compose logs strategy --tail 100")
+    print_info("  2. 检查市场数据服务: docker compose logs marketdata --tail 100")
+    print_info("  3. 检查 Redis Streams 中的 bar_close 事件")
 
 # ==================== 持仓同步功能 ====================
 
