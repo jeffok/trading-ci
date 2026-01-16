@@ -14,7 +14,7 @@ sys.path.insert(0, str(project_root))
 
 from libs.common.config import settings
 from libs.db.pg import get_conn
-from libs.strategy.repo import get_bars
+from services.strategy.repo import get_bars
 from libs.strategy.divergence import detect_three_segment_divergence
 from libs.strategy.confluence import Candle, vegas_state, engulfing, rsi_divergence, obv_divergence, fvg_proximity
 import redis

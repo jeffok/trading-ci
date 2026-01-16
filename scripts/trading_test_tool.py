@@ -1039,7 +1039,7 @@ def cmd_diagnose(args):
 def cmd_diagnose_signals(args):
     """诊断信号生成问题命令"""
     # 直接在这里实现诊断逻辑，避免导入问题
-    from libs.strategy.repo import get_bars
+    from services.strategy.repo import get_bars
     from libs.strategy.divergence import detect_three_segment_divergence
     from libs.strategy.confluence import Candle, vegas_state, engulfing, rsi_divergence, obv_divergence, fvg_proximity
     
