@@ -67,6 +67,7 @@ class Settings(BaseModel):
     data_quality_price_jump_pct: float = Field(default=0.08, alias="DATA_QUALITY_PRICE_JUMP_PCT")
     data_quality_volume_spike_multiple: float = Field(default=10.0, alias="DATA_QUALITY_VOLUME_SPIKE_MULTIPLE")
     data_quality_volume_window: int = Field(default=30, alias="DATA_QUALITY_VOLUME_WINDOW")
+    data_quality_bar_duplicate_enabled: bool = Field(default=False, alias="DATA_QUALITY_BAR_DUPLICATE_ENABLED")
 
     # Stage 11: market state (ATR + NEWS_WINDOW)
     market_atr_period: int = Field(default=14, alias="MARKET_ATR_PERIOD")

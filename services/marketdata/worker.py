@@ -226,9 +226,11 @@ async def run_marketdata() -> None:
             f = check_data_lag(close_time_ms=k["end_ms"], lag_threshold_ms=int(getattr(settings, "data_quality_lag_ms", getattr(settings, "alert_bar_close_lag_ms", 120000))), source_ts_ms=k.get("ts_ms"))
             if f:
                 findings.append(f)
-            f = check_duplicate_bar(existing=existing, incoming=incoming_bar)
-            if f:
-                findings.append(f)
+            # BAR_DUPLICATE 告警可以单独控制（默认关闭，因为这是 Bybit 的正常行为）
+            if bool(getattr(settings, "data_quality_bar_duplicate_enabled", False)):
+                f = check_duplicate_bar(existing=existing, incoming=incoming_bar)
+                if f:
+                    findings.append(f)
             prev_close = float(prev["close"]) if prev else None
             f = check_price_jump(prev_close=prev_close, close=k["close"], jump_pct_threshold=float(getattr(settings, "data_quality_price_jump_pct", 0.08)))
             if f:

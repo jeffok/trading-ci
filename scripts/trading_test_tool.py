@@ -1036,6 +1036,37 @@ def cmd_diagnose(args):
     """诊断下单失败命令"""
     diagnose_order_failure(args.symbol, args.side)
 
+def cmd_quick_test(args):
+    """快速测试下单命令（整合 quick_test_order.sh 功能）"""
+    # 使用默认参数或用户指定的参数
+    symbol = args.symbol.upper()
+    side = args.side.upper()
+    timeframe = args.timeframe
+    sl_distance_pct = args.sl_distance_pct
+    
+    print("=" * 60)
+    print("  快速测试下单")
+    print("=" * 60)
+    print()
+    print(f"交易对: {symbol}")
+    print(f"方向: {side}")
+    print(f"时间框架: {timeframe}")
+    print()
+    
+    # 调用 test 命令
+    test_args = argparse.Namespace(
+        symbol=symbol,
+        side=side,
+        entry_price=None,
+        sl_price=None,
+        sl_distance_pct=sl_distance_pct,
+        timeframe=timeframe,
+        wait_seconds=args.wait_seconds,
+        confirm=True,  # 快速测试默认跳过确认
+        auto_diagnose=True,  # 默认启用自动诊断
+    )
+    cmd_test(test_args)
+
 def cmd_diagnose_signals(args):
     """诊断信号生成问题命令"""
     # 直接在这里实现诊断逻辑，避免导入问题
@@ -2659,6 +2690,14 @@ def main():
   python -m scripts.trading_test_tool clean --all --yes
   python -m scripts.trading_test_tool clean <position_id>
 
+  # 快速测试下单（推荐，最简单）
+  python -m scripts.trading_test_tool quick-test
+  
+  # 快速测试下单（指定参数）
+  python -m scripts.trading_test_tool quick-test \\
+    --symbol ETHUSDT \\
+    --side SELL
+  
   # 执行测试下单（自动获取价格）
   python -m scripts.trading_test_tool test \\
     --symbol BTCUSDT \\
@@ -2685,6 +2724,11 @@ def main():
   python -m scripts.trading_test_tool diagnose \\
     --symbol BTCUSDT \\
     --side BUY
+  
+  # 诊断信号生成问题
+  python -m scripts.trading_test_tool diagnose-signals \\
+    --symbol BTCUSDT \\
+    --timeframe 1h
 
   # 同步持仓（检查并修复不一致）
   python -m scripts.trading_test_tool sync
@@ -2752,6 +2796,14 @@ def main():
     test_parser.add_argument('--wait-seconds', type=int, default=30, help='等待执行的时间（秒，默认: 30）')
     test_parser.add_argument('--confirm', action='store_true', help='跳过确认提示（谨慎使用）')
     test_parser.add_argument('--auto-diagnose', action='store_true', help='下单前自动运行诊断检查')
+    
+    # quick-test 命令（整合 quick_test_order.sh 功能）
+    quick_test_parser = subparsers.add_parser('quick-test', help='快速测试下单（默认参数，自动诊断，跳过确认）')
+    quick_test_parser.add_argument('--symbol', default='BTCUSDT', help='交易对（默认: BTCUSDT）')
+    quick_test_parser.add_argument('--side', default='BUY', choices=['BUY', 'SELL'], help='方向（默认: BUY）')
+    quick_test_parser.add_argument('--timeframe', default='1h', help='时间框架（默认: 1h）')
+    quick_test_parser.add_argument('--sl-distance-pct', type=float, default=0.02, help='止损距离百分比（默认: 0.02，即 2%%）')
+    quick_test_parser.add_argument('--wait-seconds', type=int, default=30, help='等待执行的时间（秒，默认: 30）')
     
     # orders 命令
     orders_parser = subparsers.add_parser('orders', help='查看订单')
@@ -2850,6 +2902,8 @@ def main():
         cmd_clean(args)
     elif args.command == 'test':
         cmd_test(args)
+    elif args.command == 'quick-test':
+        cmd_quick_test(args)
     elif args.command == 'orders':
         cmd_orders(args)
     elif args.command == 'diagnose':
