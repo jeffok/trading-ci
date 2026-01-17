@@ -2822,7 +2822,9 @@ def cmd_analyze_signals(args):
         if _rest_backfill_range:
             # 使用 _rest_backfill_range 获取所有数据
             print_info("使用 _rest_backfill_range 获取历史数据...")
-            max_bars_needed = estimated_bars + 200  # 加一些余量
+            max_bars_needed = estimated_bars + 500  # 加更多余量，确保能获取完整数据
+            print_info(f"  请求获取最多 {max_bars_needed} 根 K 线（预计需要 {estimated_bars} 根）")
+            
             all_candles_raw = _rest_backfill_range(
                 rest=rest,
                 symbol=symbol,
@@ -2831,6 +2833,25 @@ def cmd_analyze_signals(args):
                 end_ms=end_ms,
                 max_bars=max_bars_needed,
             )
+            
+            print_info(f"  _rest_backfill_range 返回了 {len(all_candles_raw)} 根 K 线")
+            
+            if len(all_candles_raw) > 0:
+                first_time = datetime.fromtimestamp(all_candles_raw[0]["start_ms"] / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                last_time = datetime.fromtimestamp(all_candles_raw[-1]["start_ms"] / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                print_info(f"  数据时间范围: {first_time} 至 {last_time}")
+                
+                # 检查数据是否完整
+                actual_first_ms = all_candles_raw[0]["start_ms"]
+                actual_last_ms = all_candles_raw[-1]["start_ms"]
+                
+                if actual_first_ms > start_ms + tf_ms:
+                    missing_start = (actual_first_ms - start_ms) / tf_ms
+                    print_warning(f"  数据不完整：缺少开始部分约 {missing_start:.0f} 根 K 线")
+                
+                if actual_last_ms < end_ms - tf_ms:
+                    missing_end = (end_ms - actual_last_ms) / tf_ms
+                    print_warning(f"  数据不完整：缺少结束部分约 {missing_end:.0f} 根 K 线")
             
             # 保存到数据库
             batch_new_count = 0
@@ -2861,6 +2882,107 @@ def cmd_analyze_signals(args):
                 batch_new_count += 1
             
             print_success(f"从 API 获取并保存了 {batch_new_count} 根 K 线")
+            
+            # 如果获取的数据少于预期，尝试手动补充缺失的部分
+            if len(all_candles_raw) < estimated_bars * 0.8:
+                print_warning(f"_rest_backfill_range 只返回了 {len(all_candles_raw)} 根，少于预期的 {estimated_bars} 根")
+                
+                if len(all_candles_raw) > 0:
+                    actual_first_ms = all_candles_raw[0]["start_ms"]
+                    actual_last_ms = all_candles_raw[-1]["start_ms"]
+                    
+                    # 如果缺少开始部分，从 start_ms 获取到 actual_first_ms（不指定 end_ms，让 API 返回从 start_ms 开始的数据）
+                    if actual_first_ms > start_ms + tf_ms:
+                        missing_start_count = int((actual_first_ms - start_ms) / tf_ms)
+                        print_warning(f"  缺少开始部分约 {missing_start_count} 根 K 线，尝试补充...")
+                        
+                        # 使用不指定 end_ms 的方式获取开始部分的数据
+                        # 从 start_ms 开始，获取到 actual_first_ms 之前
+                        supplement_start = _rest_backfill_range(
+                            rest=rest,
+                            symbol=symbol,
+                            tf=tf,
+                            start_ms=start_ms,
+                            end_ms=actual_first_ms - 1,  # 获取到实际第一根之前
+                            max_bars=missing_start_count + 100,
+                        )
+                        
+                        if supplement_start:
+                            print_info(f"  补充获取了 {len(supplement_start)} 根开始部分的 K 线")
+                            # 保存补充的数据
+                            for c in supplement_start:
+                                c_start_ms = int(c["start_ms"])
+                                if interval.isdigit():
+                                    c_close_ms = c_start_ms + int(interval) * 60 * 1000 - 1
+                                else:
+                                    c_close_ms = c_start_ms
+                                
+                                upsert_bar(
+                                    settings.database_url,
+                                    symbol=symbol,
+                                    timeframe=tf,
+                                    open_time_ms=c_start_ms,
+                                    close_time_ms=c_close_ms,
+                                    open=float(c["open"]),
+                                    high=float(c["high"]),
+                                    low=float(c["low"]),
+                                    close=float(c["close"]),
+                                    volume=float(c["volume"]),
+                                    turnover=c.get("turnover"),
+                                    source="bybit_rest_history",
+                                )
+                            all_candles_raw = supplement_start + all_candles_raw
+                            batch_new_count += len(supplement_start)
+                    
+                    # 如果缺少结束部分，从 actual_last_ms 获取到 end_ms
+                    if actual_last_ms < end_ms - tf_ms:
+                        missing_end_count = int((end_ms - actual_last_ms) / tf_ms)
+                        print_warning(f"  缺少结束部分约 {missing_end_count} 根 K 线，尝试补充...")
+                        
+                        # 从 actual_last_ms + tf_ms 开始，获取到 end_ms
+                        supplement_end = _rest_backfill_range(
+                            rest=rest,
+                            symbol=symbol,
+                            tf=tf,
+                            start_ms=actual_last_ms + tf_ms,
+                            end_ms=end_ms,
+                            max_bars=missing_end_count + 100,
+                        )
+                        
+                        if supplement_end:
+                            print_info(f"  补充获取了 {len(supplement_end)} 根结束部分的 K 线")
+                            # 保存补充的数据
+                            for c in supplement_end:
+                                c_start_ms = int(c["start_ms"])
+                                if interval.isdigit():
+                                    c_close_ms = c_start_ms + int(interval) * 60 * 1000 - 1
+                                else:
+                                    c_close_ms = c_start_ms
+                                
+                                upsert_bar(
+                                    settings.database_url,
+                                    symbol=symbol,
+                                    timeframe=tf,
+                                    open_time_ms=c_start_ms,
+                                    close_time_ms=c_close_ms,
+                                    open=float(c["open"]),
+                                    high=float(c["high"]),
+                                    low=float(c["low"]),
+                                    close=float(c["close"]),
+                                    volume=float(c["volume"]),
+                                    turnover=c.get("turnover"),
+                                    source="bybit_rest_history",
+                                )
+                            all_candles_raw = all_candles_raw + supplement_end
+                            batch_new_count += len(supplement_end)
+                    
+                    # 重新排序
+                    all_candles_raw = sorted(all_candles_raw, key=lambda x: x["start_ms"])
+                    
+                    print_success(f"补充后共有 {len(all_candles_raw)} 根 K 线")
+                else:
+                    print_warning("  无法补充：_rest_backfill_range 返回了空数据")
+            
             all_candles = all_candles_raw
         else:
             # 手动分页方式（保留原有逻辑作为后备）
