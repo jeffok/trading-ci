@@ -2878,156 +2878,117 @@ def cmd_analyze_signals(args):
                 try:
                     print(f"  请求批次 {batch_count}: start_ms={datetime.fromtimestamp(cursor/1000).strftime('%Y-%m-%d %H:%M:%S')}, end_ms={datetime.fromtimestamp(end_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}")
                     candles = rest.get_kline(
-                    symbol=symbol,
-                    interval=interval,
-                    category="linear",
-                    start_ms=cursor,
-                    end_ms=end_ms,
-                    limit=1000,
-                )
-                if not candles:
-                    print_warning(f"批次 {batch_count}：API 返回空数据")
-                    break
-                
-                # Bybit API 返回的是逆序（从新到旧），需要反转为正序
-                # reversed 后：candles[0] 是最旧的，candles[-1] 是最新的
-                candles = list(reversed(candles))
-                
-                if not candles:
-                    break
-                
-                # 找到本批次中最旧和最新的时间戳（用于调试和推进游标）
-                batch_valid_candles = []
-                min_start_ms = None
-                max_start_ms = None
-                
-                # 参考 _rest_backfill_range 的逻辑：遍历所有 candles，只保存时间范围内的
-                for c in candles:
-                    c_start_ms = int(c["start_ms"])
-                    # 只处理时间范围内的数据
-                    if c_start_ms < start_ms or c_start_ms > end_ms:
-                        continue
-                    
-                    batch_valid_candles.append(c)
-                    if min_start_ms is None or c_start_ms < min_start_ms:
-                        min_start_ms = c_start_ms
-                    if max_start_ms is None or c_start_ms > max_start_ms:
-                        max_start_ms = c_start_ms
-                
-                # 如果没有有效数据，说明已超出范围
-                if not batch_valid_candles:
-                    print_warning(f"批次 {batch_count}：没有有效数据在时间范围内，可能已获取完")
-                    break
-                
-                if min_start_ms is None or max_start_ms is None:
-                    break
-                
-                # 保存有效数据到数据库
-                batch_new_count = 0
-                for c in batch_valid_candles:
-                    c_start_ms = int(c["start_ms"])
-                    
-                    # 计算 close_time_ms
-                    if interval.isdigit():
-                        c_close_ms = c_start_ms + int(interval) * 60 * 1000 - 1
-                    else:
-                        c_close_ms = c_start_ms
-                    
-                    # 保存到数据库
-                    upsert_bar(
-                        settings.database_url,
                         symbol=symbol,
-                        timeframe=tf,
-                        open_time_ms=c_start_ms,
-                        close_time_ms=c_close_ms,
-                        open=float(c["open"]),
-                        high=float(c["high"]),
-                        low=float(c["low"]),
-                        close=float(c["close"]),
-                        volume=float(c["volume"]),
-                        turnover=c.get("turnover"),
-                        source="bybit_rest_history",
+                        interval=interval,
+                        category="linear",
+                        start_ms=cursor,
+                        end_ms=end_ms,
+                        limit=1000,
                     )
-                    batch_new_count += 1
-                
-                all_candles.extend(batch_valid_candles)
-                
-                # 更新游标：使用本批次中最新（最大）的时间戳 + 1个周期
-                # 参考 _rest_backfill_range 的实现：last = int(candles[-1]["start_ms"])
-                # 反转后 candles[-1] 是最新的，应该用最新的时间戳推进游标
-                # 注意：必须确保使用的时间戳在时间范围内，否则可能立即超出范围
-                # 使用 max_start_ms（过滤后的最大值）而不是 candles[-1]，确保在时间范围内
-                if max_start_ms is None:
-                    print_warning(f"批次 {batch_count}：max_start_ms 为 None，无法推进游标")
-                    break
-                
-                # 使用过滤后的最大值（确保在时间范围内）来推进游标
-                # 关键：我们需要检查 min_start_ms（最旧的数据）是否已经达到 start_ms
-                # 如果 min_start_ms 还没有达到 start_ms，说明还有更早的数据需要获取
-                # 即使 max_start_ms 已经接近 end_ms，只要 min_start_ms 还没到 start_ms，就应该继续获取
-                
-                # 检查是否已经获取到起始时间
-                if min_start_ms <= start_ms:
-                    # 已经获取到起始时间，检查是否已经获取到结束时间
-                    if max_start_ms >= end_ms - tf_ms:
-                        # 已经获取到整个时间范围，可以退出
-                        print_info(f"批次 {batch_count}：已获取完整时间范围（{datetime.fromtimestamp(min_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')} 至 {datetime.fromtimestamp(max_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}），数据获取完成")
+                    if not candles:
+                        print_warning(f"批次 {batch_count}：API 返回空数据")
                         break
-                    else:
-                        # 已经获取到起始时间，但还没到结束时间，继续从最早的数据往前推进
-                        # 需要从 min_start_ms 往前获取，而不是从 max_start_ms 往后获取
-                        # 这种情况不应该发生，因为我们应该从 start_ms 往前推进
-                        print_warning(f"批次 {batch_count}：已获取到起始时间，但还没到结束时间，这不应该发生")
-                        # 继续使用 max_start_ms 推进
-                        next_cursor = max_start_ms + tf_ms
-                else:
-                    # 还没获取到起始时间，说明还有更早的数据需要获取
-                    # 这种情况下，即使 max_start_ms 超过 end_ms，也应该继续从更早的时间获取
-                    # 继续使用 min_start_ms - tf_ms 作为下次的游标（往前推进）
-                    next_cursor = min_start_ms  # 从最旧的数据往前推进
                     
-                    # 如果 next_cursor 小于 start_ms，说明已经超出范围
-                    if next_cursor < start_ms:
-                        # 尝试从 start_ms 开始
-                        next_cursor = start_ms
+                    # Bybit API 返回的是逆序（从新到旧），需要反转为正序
+                    # reversed 后：candles[0] 是最旧的，candles[-1] 是最新的
+                    candles = list(reversed(candles))
                     
-                    print_info(f"批次 {batch_count}：尚未获取到起始时间（min_start_ms={datetime.fromtimestamp(min_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}, start_ms={datetime.fromtimestamp(start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}），继续从更早的时间获取...")
-                
-                # 计算下次游标（从最大值推进，用于获取更早的数据）
-                # 如果 next_cursor 没有设置，使用 max_start_ms 推进
-                if 'next_cursor' not in locals() or next_cursor is None:
-                    last = max_start_ms
+                    if not candles:
+                        break
+                    
+                    # 找到本批次中最旧和最新的时间戳（用于调试和推进游标）
+                    batch_valid_candles = []
+                    min_start_ms = None
+                    max_start_ms = None
+                    
+                    # 参考 _rest_backfill_range 的逻辑：遍历所有 candles，只保存时间范围内的
+                    for c in candles:
+                        c_start_ms = int(c["start_ms"])
+                        # 只处理时间范围内的数据
+                        if c_start_ms < start_ms or c_start_ms > end_ms:
+                            continue
+                        
+                        batch_valid_candles.append(c)
+                        if min_start_ms is None or c_start_ms < min_start_ms:
+                            min_start_ms = c_start_ms
+                        if max_start_ms is None or c_start_ms > max_start_ms:
+                            max_start_ms = c_start_ms
+                    
+                    # 如果没有有效数据，说明已超出范围
+                    if not batch_valid_candles:
+                        print_warning(f"批次 {batch_count}：没有有效数据在时间范围内，可能已获取完")
+                        break
+                    
+                    if min_start_ms is None or max_start_ms is None:
+                        break
+                    
+                    # 保存有效数据到数据库
+                    batch_new_count = 0
+                    for c in batch_valid_candles:
+                        c_start_ms = int(c["start_ms"])
+                        
+                        # 计算 close_time_ms
+                        if interval.isdigit():
+                            c_close_ms = c_start_ms + int(interval) * 60 * 1000 - 1
+                        else:
+                            c_close_ms = c_start_ms
+                        
+                        # 保存到数据库
+                        upsert_bar(
+                            settings.database_url,
+                            symbol=symbol,
+                            timeframe=tf,
+                            open_time_ms=c_start_ms,
+                            close_time_ms=c_close_ms,
+                            open=float(c["open"]),
+                            high=float(c["high"]),
+                            low=float(c["low"]),
+                            close=float(c["close"]),
+                            volume=float(c["volume"]),
+                            turnover=c.get("turnover"),
+                            source="bybit_rest_history",
+                        )
+                        batch_new_count += 1
+                    
+                    all_candles.extend(batch_valid_candles)
+                    
+                    # 更新游标：使用本批次中最新（最大）的时间戳 + 1个周期
+                    # 参考 _rest_backfill_range 的实现：last = int(candles[-1]["start_ms"])
+                    last = int(candles[-1]["start_ms"])
                     next_cursor = last + tf_ms
-                
-                # 如果游标已经超过结束时间，但还没获取到起始时间，不应该退出
-                if next_cursor > end_ms and min_start_ms > start_ms:
-                    # 游标超过结束时间，但还没获取到起始时间，可能需要调整策略
-                    # 这种情况下，我们应该从 min_start_ms 往前获取
-                    print_info(f"批次 {batch_count}：游标已超过结束时间，但尚未获取到起始时间，调整获取策略...")
-                    next_cursor = min_start_ms  # 从最旧的数据往前获取
-                
-                # 如果游标没有推进，防止死循环（参考 _rest_backfill_range）
-                if next_cursor <= cursor:
-                    print_warning(f"批次 {batch_count}：游标未推进（{datetime.fromtimestamp(cursor/1000).strftime('%Y-%m-%d %H:%M:%S')} -> {datetime.fromtimestamp(next_cursor/1000).strftime('%Y-%m-%d %H:%M:%S')}），可能已获取完所有数据")
-                    print_warning(f"  本批次时间范围: {datetime.fromtimestamp(min_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')} 至 {datetime.fromtimestamp(max_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}，获取了 {batch_new_count} 根")
-                    print_warning(f"  last K线时间: {datetime.fromtimestamp(last/1000).strftime('%Y-%m-%d %H:%M:%S')}，tf_ms={tf_ms}")
+                    
+                    # 如果游标已经超过结束时间，说明已获取完
+                    if next_cursor > end_ms:
+                        # 如果返回的K线少于1000根，说明已经到达边界
+                        if len(candles) < 1000:
+                            print_info(f"批次 {batch_count}：游标已超过结束时间且返回数据少于1000根（{len(candles)}根），数据获取完成")
+                            break
+                        else:
+                            # 返回了1000根，但游标已超过结束时间，可能还有数据
+                            print_info(f"批次 {batch_count}：游标已超过结束时间，但返回了{len(candles)}根数据，继续尝试获取...")
+                            # 继续使用 last 推进，但限制在 end_ms 内
+                            next_cursor = min(last + tf_ms, end_ms + tf_ms)
+                    
+                    # 如果游标没有推进，防止死循环（参考 _rest_backfill_range）
+                    if next_cursor <= cursor:
+                        print_warning(f"批次 {batch_count}：游标未推进（{datetime.fromtimestamp(cursor/1000).strftime('%Y-%m-%d %H:%M:%S')} -> {datetime.fromtimestamp(next_cursor/1000).strftime('%Y-%m-%d %H:%M:%S')}），可能已获取完所有数据")
+                        break
+                    
+                    cursor = next_cursor
+                    
+                    # 打印批次信息
+                    print(f"  已获取批次 {batch_count}，保存了 {batch_new_count} 根，时间范围: {datetime.fromtimestamp(min_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')} 至 {datetime.fromtimestamp(max_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}，下一批游标: {datetime.fromtimestamp(next_cursor/1000).strftime('%Y-%m-%d %H:%M:%S')}")
+                    
+                    # 如果返回的K线少于1000根，说明已到达边界
+                    if len(candles) < 1000:
+                        print_info(f"批次 {batch_count}：返回的K线少于1000根（{len(candles)}根），已到达边界")
+                        break
+                    
+                    time.sleep(0.2)  # 避免 API 限流
+                    
+                except Exception as e:
+                    print_error(f"获取批次 {batch_count} 失败: {e}")
                     break
-                
-                cursor = next_cursor
-                
-                # 打印批次信息（无论是否继续）
-                print(f"  已获取批次 {batch_count}，保存了 {batch_new_count} 根，时间范围: {datetime.fromtimestamp(min_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')} 至 {datetime.fromtimestamp(max_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}，下一批游标: {datetime.fromtimestamp(next_cursor/1000).strftime('%Y-%m-%d %H:%M:%S')}")
-                
-                # 如果返回的K线少于1000根，说明已到达边界
-                if len(candles) < 1000:
-                    print_info(f"批次 {batch_count}：返回的K线少于1000根（{len(candles)}根），已到达边界")
-                    break
-                
-                time.sleep(0.2)  # 避免 API 限流
-                
-            except Exception as e:
-                print_error(f"获取批次 {batch_count} 失败: {e}")
-                break
         
         print_success(f"从 API 获取并保存了约 {len(all_candles)} 根 K 线")
         print()
