@@ -2883,34 +2883,58 @@ def cmd_analyze_signals(args):
             
             print_success(f"从 API 获取并保存了 {batch_new_count} 根 K 线")
             
-            # 如果获取的数据少于预期，尝试手动补充缺失的部分
-            if len(all_candles_raw) < estimated_bars * 0.8:
-                print_warning(f"_rest_backfill_range 只返回了 {len(all_candles_raw)} 根，少于预期的 {estimated_bars} 根")
+            # 如果获取的数据少于预期，循环补充直到获取完整数据
+            max_supplement_rounds = 20  # 最多补充20轮，避免无限循环
+            supplement_round = 0
+            
+            while len(all_candles_raw) < estimated_bars * 0.95 and supplement_round < max_supplement_rounds:
+                supplement_round += 1
                 
-                if len(all_candles_raw) > 0:
-                    actual_first_ms = all_candles_raw[0]["start_ms"]
-                    actual_last_ms = all_candles_raw[-1]["start_ms"]
+                if len(all_candles_raw) == 0:
+                    print_warning("无法补充：_rest_backfill_range 返回了空数据")
+                    break
+                
+                actual_first_ms = all_candles_raw[0]["start_ms"]
+                actual_last_ms = all_candles_raw[-1]["start_ms"]
+                current_count = len(all_candles_raw)
+                
+                # 检查是否还需要补充
+                needs_start = actual_first_ms > start_ms + tf_ms
+                needs_end = actual_last_ms < end_ms - tf_ms
+                
+                if not needs_start and not needs_end:
+                    # 数据已完整
+                    break
+                
+                if supplement_round == 1:
+                    print_warning(f"_rest_backfill_range 只返回了 {current_count} 根，少于预期的 {estimated_bars} 根，开始循环补充...")
+                
+                print_info(f"补充轮次 {supplement_round}：当前 {current_count} 根，需要约 {estimated_bars} 根")
+                
+                # 如果缺少开始部分，分批次补充
+                if needs_start:
+                    missing_start_count = int((actual_first_ms - start_ms) / tf_ms)
+                    print_info(f"  补充开始部分：缺少约 {missing_start_count} 根，从 {datetime.fromtimestamp(start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')} 到 {datetime.fromtimestamp(actual_first_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}")
                     
-                    # 如果缺少开始部分，从 start_ms 获取到 actual_first_ms（不指定 end_ms，让 API 返回从 start_ms 开始的数据）
-                    if actual_first_ms > start_ms + tf_ms:
-                        missing_start_count = int((actual_first_ms - start_ms) / tf_ms)
-                        print_warning(f"  缺少开始部分约 {missing_start_count} 根 K 线，尝试补充...")
-                        
-                        # 使用不指定 end_ms 的方式获取开始部分的数据
-                        # 从 start_ms 开始，获取到 actual_first_ms 之前
-                        supplement_start = _rest_backfill_range(
+                    # 使用分段方式获取，每次最多获取2000根（分多次请求）
+                    segment_end_ms = actual_first_ms - 1
+                    segment_start_ms = max(start_ms, segment_end_ms - 2000 * tf_ms)  # 每次最多2000根
+                    
+                    while segment_end_ms >= start_ms:
+                        segment_bars = _rest_backfill_range(
                             rest=rest,
                             symbol=symbol,
                             tf=tf,
-                            start_ms=start_ms,
-                            end_ms=actual_first_ms - 1,  # 获取到实际第一根之前
-                            max_bars=missing_start_count + 100,
+                            start_ms=segment_start_ms,
+                            end_ms=segment_end_ms,
+                            max_bars=2100,  # 加一些余量
                         )
                         
-                        if supplement_start:
-                            print_info(f"  补充获取了 {len(supplement_start)} 根开始部分的 K 线")
+                        if segment_bars:
+                            print_info(f"    获取了 {len(segment_bars)} 根（{datetime.fromtimestamp(segment_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')} 至 {datetime.fromtimestamp(segment_end_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}）")
+                            
                             # 保存补充的数据
-                            for c in supplement_start:
+                            for c in segment_bars:
                                 c_start_ms = int(c["start_ms"])
                                 if interval.isdigit():
                                     c_close_ms = c_start_ms + int(interval) * 60 * 1000 - 1
@@ -2931,28 +2955,54 @@ def cmd_analyze_signals(args):
                                     turnover=c.get("turnover"),
                                     source="bybit_rest_history",
                                 )
-                            all_candles_raw = supplement_start + all_candles_raw
-                            batch_new_count += len(supplement_start)
-                    
-                    # 如果缺少结束部分，从 actual_last_ms 获取到 end_ms
-                    if actual_last_ms < end_ms - tf_ms:
-                        missing_end_count = int((end_ms - actual_last_ms) / tf_ms)
-                        print_warning(f"  缺少结束部分约 {missing_end_count} 根 K 线，尝试补充...")
+                            
+                            all_candles_raw.extend(segment_bars)
+                            batch_new_count += len(segment_bars)
+                            
+                            # 更新 actual_first_ms（取最小值）
+                            if segment_bars:
+                                new_first = min(c["start_ms"] for c in segment_bars)
+                                if new_first < actual_first_ms:
+                                    actual_first_ms = new_first
                         
-                        # 从 actual_last_ms + tf_ms 开始，获取到 end_ms
-                        supplement_end = _rest_backfill_range(
+                        # 准备下一段
+                        segment_end_ms = segment_start_ms - 1
+                        segment_start_ms = max(start_ms, segment_end_ms - 2000 * tf_ms)
+                        
+                        if segment_end_ms < start_ms:
+                            break
+                        
+                        time.sleep(0.2)  # 避免 API 限流
+                    
+                    # 重新排序和去重
+                    uniq_dict = {c["start_ms"]: c for c in all_candles_raw}
+                    all_candles_raw = [uniq_dict[k] for k in sorted(uniq_dict.keys())]
+                    actual_first_ms = all_candles_raw[0]["start_ms"] if all_candles_raw else actual_first_ms
+                
+                # 如果缺少结束部分，分批次补充
+                if needs_end:
+                    missing_end_count = int((end_ms - actual_last_ms) / tf_ms)
+                    print_info(f"  补充结束部分：缺少约 {missing_end_count} 根，从 {datetime.fromtimestamp(actual_last_ms/1000).strftime('%Y-%m-%d %H:%M:%S')} 到 {datetime.fromtimestamp(end_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}")
+                    
+                    # 使用分段方式获取，每次最多获取2000根
+                    segment_start_ms = actual_last_ms + tf_ms
+                    segment_end_ms = min(end_ms, segment_start_ms + 2000 * tf_ms)  # 每次最多2000根
+                    
+                    while segment_start_ms <= end_ms:
+                        segment_bars = _rest_backfill_range(
                             rest=rest,
                             symbol=symbol,
                             tf=tf,
-                            start_ms=actual_last_ms + tf_ms,
-                            end_ms=end_ms,
-                            max_bars=missing_end_count + 100,
+                            start_ms=segment_start_ms,
+                            end_ms=segment_end_ms,
+                            max_bars=2100,  # 加一些余量
                         )
                         
-                        if supplement_end:
-                            print_info(f"  补充获取了 {len(supplement_end)} 根结束部分的 K 线")
+                        if segment_bars:
+                            print_info(f"    获取了 {len(segment_bars)} 根（{datetime.fromtimestamp(segment_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')} 至 {datetime.fromtimestamp(segment_end_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}）")
+                            
                             # 保存补充的数据
-                            for c in supplement_end:
+                            for c in segment_bars:
                                 c_start_ms = int(c["start_ms"])
                                 if interval.isdigit():
                                     c_close_ms = c_start_ms + int(interval) * 60 * 1000 - 1
@@ -2973,15 +3023,45 @@ def cmd_analyze_signals(args):
                                     turnover=c.get("turnover"),
                                     source="bybit_rest_history",
                                 )
-                            all_candles_raw = all_candles_raw + supplement_end
-                            batch_new_count += len(supplement_end)
+                            
+                            all_candles_raw.extend(segment_bars)
+                            batch_new_count += len(segment_bars)
+                            
+                            # 更新 actual_last_ms（取最大值）
+                            if segment_bars:
+                                new_last = max(c["start_ms"] for c in segment_bars)
+                                if new_last > actual_last_ms:
+                                    actual_last_ms = new_last
+                        
+                        # 准备下一段
+                        segment_start_ms = segment_end_ms + tf_ms
+                        segment_end_ms = min(end_ms, segment_start_ms + 2000 * tf_ms)
+                        
+                        if segment_start_ms > end_ms:
+                            break
+                        
+                        time.sleep(0.2)  # 避免 API 限流
                     
-                    # 重新排序
-                    all_candles_raw = sorted(all_candles_raw, key=lambda x: x["start_ms"])
-                    
-                    print_success(f"补充后共有 {len(all_candles_raw)} 根 K 线")
-                else:
-                    print_warning("  无法补充：_rest_backfill_range 返回了空数据")
+                    # 重新排序和去重
+                    uniq_dict = {c["start_ms"]: c for c in all_candles_raw}
+                    all_candles_raw = [uniq_dict[k] for k in sorted(uniq_dict.keys())]
+                    actual_last_ms = all_candles_raw[-1]["start_ms"] if all_candles_raw else actual_last_ms
+                
+                # 检查是否还需要继续补充
+                if len(all_candles_raw) >= estimated_bars * 0.95:
+                    print_success(f"补充完成！现在有 {len(all_candles_raw)} 根 K 线（已达到预期的 95% 以上）")
+                    break
+                
+                if supplement_round >= max_supplement_rounds:
+                    print_warning(f"已达到最大补充轮次（{max_supplement_rounds}），停止补充")
+                    print_warning(f"当前有 {len(all_candles_raw)} 根 K 线，预计需要 {estimated_bars} 根")
+                    break
+            
+            # 最终排序和去重
+            if all_candles_raw:
+                uniq_dict = {c["start_ms"]: c for c in all_candles_raw}
+                all_candles_raw = [uniq_dict[k] for k in sorted(uniq_dict.keys())]
+                print_success(f"最终获取了 {len(all_candles_raw)} 根 K 线")
             
             all_candles = all_candles_raw
         else:
