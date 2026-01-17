@@ -2905,20 +2905,34 @@ def cmd_analyze_signals(args):
                 # 更新游标：使用本批次中最新（最大）的时间戳 + 1个周期
                 # 参考 _rest_backfill_range 的实现：last = int(candles[-1]["start_ms"])
                 # 反转后 candles[-1] 是最新的，应该用最新的时间戳推进游标
-                # 注意：这里应该用反转后的 candles[-1]，即本批次中最新的K线
-                # 但需要确保这个时间戳在时间范围内
-                last = int(candles[-1]["start_ms"])  # 反转后最新（最大）的时间戳
+                # 注意：必须确保使用的时间戳在时间范围内，否则可能立即超出范围
+                # 使用 max_start_ms（过滤后的最大值）而不是 candles[-1]，确保在时间范围内
+                if max_start_ms is None:
+                    print_warning(f"批次 {batch_count}：max_start_ms 为 None，无法推进游标")
+                    break
                 
-                # 如果 last 不在时间范围内，使用 max_start_ms（过滤后的最大值）
-                if last < start_ms or last > end_ms:
-                    last = max_start_ms
-                
+                # 使用过滤后的最大值（确保在时间范围内）来推进游标
+                last = max_start_ms  # 使用过滤后的最大值，确保在 [start_ms, end_ms] 范围内
                 next_cursor = last + tf_ms
                 
-                # 如果游标已经超过结束时间，说明已获取完
+                # 检查是否已经到达或超过结束时间
+                # 如果 max_start_ms 已经接近或达到 end_ms，但返回的数据是1000根（满批），
+                # 说明可能还有更多数据，继续尝试获取；否则说明已经获取完
                 if next_cursor > end_ms:
-                    print_info(f"批次 {batch_count}：游标已超过结束时间（{datetime.fromtimestamp(next_cursor/1000).strftime('%Y-%m-%d %H:%M:%S')} > {datetime.fromtimestamp(end_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}），数据获取完成")
-                    break
+                    # 如果返回的K线少于1000根，说明已经到达边界，可以退出
+                    if len(candles) < 1000:
+                        print_info(f"批次 {batch_count}：游标已超过结束时间且返回数据少于1000根（{len(candles)}根），数据获取完成")
+                        break
+                    else:
+                        # 返回了1000根，但游标已超过结束时间，可能还有数据
+                        # 继续使用 max_start_ms 作为下次的游标，尝试获取剩余数据
+                        print_info(f"批次 {batch_count}：游标已超过结束时间（{datetime.fromtimestamp(next_cursor/1000).strftime('%Y-%m-%d %H:%M:%S')} > {datetime.fromtimestamp(end_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}），但返回了{len(candles)}根数据，继续尝试获取...")
+                        # 使用 max_start_ms + tf_ms 作为下次游标，但不要超过 end_ms
+                        next_cursor = min(max_start_ms + tf_ms, end_ms + tf_ms)
+                        # 如果 next_cursor 仍然超过 end_ms，说明真的没有更多数据了
+                        if next_cursor > end_ms:
+                            print_info(f"批次 {batch_count}：无法继续获取，数据获取完成")
+                            break
                 
                 # 如果游标没有推进，防止死循环（参考 _rest_backfill_range）
                 if next_cursor <= cursor:
