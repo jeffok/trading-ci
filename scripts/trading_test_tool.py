@@ -2687,17 +2687,108 @@ def cmd_analyze_signals(args):
     strategy_name_display = (strategy_filter if strategy_filter else "ALL（所有策略）")
     print_info(f"策略筛选: {strategy_name_display}")
     
-    # 计算时间范围（过去 N 年）
-    years = args.years
-    end_time = datetime.now()
-    start_time = end_time - timedelta(days=years * 365)
+    # 计算时间范围（支持多种方式）
+    # 优先级：start-date + end-date > months/days/years（从当前时间往前推）
+    try:
+        # 检查参数互斥性
+        time_range_params = [args.years != 3, args.months is not None, args.days is not None, args.start_date is not None]
+        if sum(time_range_params) > 1:
+            print_error("时间范围参数互斥，请只指定一种：--years、--months、--days 或 --start-date")
+            print_info("示例：")
+            print("  --years 1     # 过去1年")
+            print("  --months 12   # 过去12个月")
+            print("  --days 365    # 过去365天")
+            print("  --start-date 2023-01-01 --end-date 2023-12-31  # 精确日期范围")
+            sys.exit(1)
+        
+        if args.start_date:
+            # 解析开始日期
+            start_date_str = args.start_date.strip()
+            # 尝试多种日期格式
+            date_formats = [
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d",
+                "%Y/%m/%d %H:%M:%S",
+                "%Y/%m/%d",
+            ]
+            start_time = None
+            for fmt in date_formats:
+                try:
+                    start_time = datetime.strptime(start_date_str, fmt)
+                    break
+                except ValueError:
+                    continue
+            
+            if start_time is None:
+                print_error(f"无法解析开始日期: {args.start_date}")
+                print_info("支持的日期格式: YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS")
+                sys.exit(1)
+            
+            # 解析结束日期（精确日期范围模式）
+            if args.end_date:
+                # 使用结束日期
+                end_date_str = args.end_date.strip()
+                end_time = None
+                for fmt in date_formats:
+                    try:
+                        end_time = datetime.strptime(end_date_str, fmt)
+                        break
+                    except ValueError:
+                        continue
+                
+                if end_time is None:
+                    print_error(f"无法解析结束日期: {args.end_date}")
+                    print_info("支持的日期格式: YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS")
+                    sys.exit(1)
+                
+                years = (end_time - start_time).days / 365.0  # 用于显示
+            else:
+                # 未指定结束日期，使用当前时间
+                end_time = datetime.now()
+                years = (end_time - start_time).days / 365.0  # 用于显示
+        elif args.months:
+            # 使用月数方式（从当前时间往前推）
+            end_time = datetime.now()
+            start_time = end_time - timedelta(days=args.months * 30)  # 近似：每月30天
+            years = args.months / 12.0  # 用于显示
+        elif args.days:
+            # 使用天数方式（从当前时间往前推）
+            end_time = datetime.now()
+            start_time = end_time - timedelta(days=args.days)
+            years = args.days / 365.0  # 用于显示
+        else:
+            # 使用年数方式（默认，从当前时间往前推）
+            years = args.years
+            end_time = datetime.now()
+            start_time = end_time - timedelta(days=years * 365)
+    except Exception as e:
+        print_error(f"日期解析错误: {e}")
+        sys.exit(1)
+    
+    # 确保开始时间 < 结束时间
+    if start_time >= end_time:
+        print_error(f"开始时间必须早于结束时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')} >= {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        sys.exit(1)
     
     start_ms = int(start_time.timestamp() * 1000)
     end_ms = int(end_time.timestamp() * 1000)
     
     print_info(f"Symbol: {symbol}")
     print_info(f"Timeframe: {tf}")
-    print_info(f"时间范围: {start_time.strftime('%Y-%m-%d %H:%M:%S')} 至 {end_time.strftime('%Y-%m-%d %H:%M:%S')} (过去 {years} 年)")
+    time_range_desc = f"{start_time.strftime('%Y-%m-%d %H:%M:%S')} 至 {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    
+    # 根据参数类型显示不同的描述
+    if args.start_date:
+        days_span = (end_time - start_time).days
+        time_range_desc += f" (精确日期范围: 共 {days_span} 天)"
+    elif args.months:
+        time_range_desc += f" (过去 {args.months} 个月)"
+    elif args.days:
+        time_range_desc += f" (过去 {args.days} 天)"
+    else:
+        time_range_desc += f" (过去 {years} 年)"
+    
+    print_info(f"时间范围: {time_range_desc}")
     print()
     
     # 1. 检查数据库中是否有数据，如果没有则从 Bybit API 获取
@@ -3071,7 +3162,18 @@ def main():
     analyze_parser = subparsers.add_parser('analyze-signals', help='历史信号分析：分析过去N年的策略信号出现次数')
     analyze_parser.add_argument('--symbol', required=True, help='交易对，如 BTCUSDT')
     analyze_parser.add_argument('--timeframe', required=True, help='时间框架，如 1m/5m/15m/30m/1h/4h/1d')
-    analyze_parser.add_argument('--years', type=int, default=3, help='分析过去N年的数据（默认: 3）')
+    
+    # 时间范围参数（多种方式，互斥）
+    time_group = analyze_parser.add_argument_group('时间范围参数（可选，多种方式，互斥）')
+    time_group.add_argument('--years', type=int, default=3, help='分析过去N年的数据（默认: 3）')
+    time_group.add_argument('--months', type=int, help='分析过去N个月的数据（如 --months 12 表示过去12个月）')
+    time_group.add_argument('--days', type=int, help='分析过去N天的数据（如 --days 365 表示过去365天）')
+    
+    # 精确日期范围参数（可选，与上面互斥）
+    date_group = analyze_parser.add_argument_group('精确日期范围参数（可选，与时间范围参数互斥）')
+    date_group.add_argument('--start-date', help='开始日期，格式: YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS（如 2023-01-01）')
+    date_group.add_argument('--end-date', help='结束日期，格式: YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS（如 2024-12-31）。不指定则使用当前时间')
+    
     analyze_parser.add_argument('--fetch-from-api', action='store_true', help='如果数据库数据不完整，从 Bybit API 获取历史数据')
     analyze_parser.add_argument('--strategy', default='', help='策略类型筛选（ALL/MACD_3SEG_DIVERGENCE 或确认项组合如 ENGULFING+RSI_DIV，默认: ALL）')
     analyze_parser.add_argument('--show-all-signals', action='store_true', help='显示所有信号的详细信息（默认只显示前10个示例）')
