@@ -2832,17 +2832,19 @@ def cmd_analyze_signals(args):
                 if not candles:
                     break
                 
-                if not candles:
-                    break
-                
                 # Bybit API 返回的是逆序（从新到旧），需要反转为正序
                 # reversed 后：candles[0] 是最旧的，candles[-1] 是最新的
                 candles = list(reversed(candles))
                 
-                # 找到本批次中最新（最大）的时间戳（用于推进游标）
+                if not candles:
+                    break
+                
+                # 找到本批次中最旧和最新的时间戳（用于调试和推进游标）
                 batch_valid_candles = []
+                min_start_ms = None
                 max_start_ms = None
                 
+                # 参考 _rest_backfill_range 的逻辑：遍历所有 candles，只保存时间范围内的
                 for c in candles:
                     c_start_ms = int(c["start_ms"])
                     # 只处理时间范围内的数据
@@ -2850,11 +2852,17 @@ def cmd_analyze_signals(args):
                         continue
                     
                     batch_valid_candles.append(c)
+                    if min_start_ms is None or c_start_ms < min_start_ms:
+                        min_start_ms = c_start_ms
                     if max_start_ms is None or c_start_ms > max_start_ms:
                         max_start_ms = c_start_ms
                 
                 # 如果没有有效数据，说明已超出范围
-                if not batch_valid_candles or max_start_ms is None:
+                if not batch_valid_candles:
+                    print_warning(f"批次 {batch_count}：没有有效数据在时间范围内，可能已获取完")
+                    break
+                
+                if min_start_ms is None or max_start_ms is None:
                     break
                 
                 # 保存有效数据到数据库
@@ -2887,17 +2895,22 @@ def cmd_analyze_signals(args):
                 
                 all_candles.extend(batch_valid_candles)
                 
-                # 更新游标：使用本批次中最大（最新）的时间戳 + 1个周期
-                # 这样下次获取时会从下一根K线开始
-                next_cursor = max_start_ms + tf_ms
+                # 更新游标：使用本批次中最新（最大）的时间戳 + 1个周期
+                # 参考 _rest_backfill_range 的实现：last = int(candles[-1]["start_ms"])
+                # 反转后 candles[-1] 是最新的，应该用最新的时间戳推进游标
+                # 注意：这里应该用反转后的 candles[-1]，即本批次中最新的K线
+                last = int(candles[-1]["start_ms"])  # 反转后最新（最大）的时间戳
+                next_cursor = last + tf_ms
                 
                 # 如果游标已经超过结束时间，说明已获取完
                 if next_cursor > end_ms:
                     break
                 
-                # 如果游标没有推进，防止死循环
+                # 如果游标没有推进，防止死循环（参考 _rest_backfill_range）
                 if next_cursor <= cursor:
-                    print_warning(f"批次 {batch_count}：游标未推进（{cursor} -> {next_cursor}），可能已获取完所有数据")
+                    print_warning(f"批次 {batch_count}：游标未推进（{datetime.fromtimestamp(cursor/1000).strftime('%Y-%m-%d %H:%M:%S')} -> {datetime.fromtimestamp(next_cursor/1000).strftime('%Y-%m-%d %H:%M:%S')}），可能已获取完所有数据")
+                    print_warning(f"  本批次时间范围: {datetime.fromtimestamp(min_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')} 至 {datetime.fromtimestamp(max_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}，获取了 {batch_new_count} 根")
+                    print_warning(f"  last K线时间: {datetime.fromtimestamp(last/1000).strftime('%Y-%m-%d %H:%M:%S')}，tf_ms={tf_ms}")
                     break
                 
                 cursor = next_cursor
@@ -2906,7 +2919,7 @@ def cmd_analyze_signals(args):
                 if len(candles) < 1000:
                     break
                 
-                print(f"  已获取批次 {batch_count}，当前游标: {datetime.fromtimestamp(cursor/1000).strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"  已获取批次 {batch_count}，保存了 {batch_new_count} 根，时间范围: {datetime.fromtimestamp(min_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')} 至 {datetime.fromtimestamp(max_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}，下一批游标: {datetime.fromtimestamp(next_cursor/1000).strftime('%Y-%m-%d %H:%M:%S')}")
                 time.sleep(0.2)  # 避免 API 限流
                 
             except Exception as e:
