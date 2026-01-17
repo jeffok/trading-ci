@@ -2818,9 +2818,15 @@ def cmd_analyze_signals(args):
         batch_count = 0
         max_batches = 200  # 安全限制
         
+        print_info(f"开始从 Bybit API 获取历史数据...")
+        print_info(f"  时间范围: {datetime.fromtimestamp(start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')} 至 {datetime.fromtimestamp(end_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}")
+        print_info(f"  初始游标: {datetime.fromtimestamp(cursor/1000).strftime('%Y-%m-%d %H:%M:%S')}")
+        print()
+        
         while cursor < end_ms and batch_count < max_batches:
             batch_count += 1
             try:
+                print(f"  请求批次 {batch_count}: start_ms={datetime.fromtimestamp(cursor/1000).strftime('%Y-%m-%d %H:%M:%S')}, end_ms={datetime.fromtimestamp(end_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}")
                 candles = rest.get_kline(
                     symbol=symbol,
                     interval=interval,
@@ -2830,6 +2836,7 @@ def cmd_analyze_signals(args):
                     limit=1000,
                 )
                 if not candles:
+                    print_warning(f"批次 {batch_count}：API 返回空数据")
                     break
                 
                 # Bybit API 返回的是逆序（从新到旧），需要反转为正序
@@ -2899,11 +2906,18 @@ def cmd_analyze_signals(args):
                 # 参考 _rest_backfill_range 的实现：last = int(candles[-1]["start_ms"])
                 # 反转后 candles[-1] 是最新的，应该用最新的时间戳推进游标
                 # 注意：这里应该用反转后的 candles[-1]，即本批次中最新的K线
+                # 但需要确保这个时间戳在时间范围内
                 last = int(candles[-1]["start_ms"])  # 反转后最新（最大）的时间戳
+                
+                # 如果 last 不在时间范围内，使用 max_start_ms（过滤后的最大值）
+                if last < start_ms or last > end_ms:
+                    last = max_start_ms
+                
                 next_cursor = last + tf_ms
                 
                 # 如果游标已经超过结束时间，说明已获取完
                 if next_cursor > end_ms:
+                    print_info(f"批次 {batch_count}：游标已超过结束时间（{datetime.fromtimestamp(next_cursor/1000).strftime('%Y-%m-%d %H:%M:%S')} > {datetime.fromtimestamp(end_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}），数据获取完成")
                     break
                 
                 # 如果游标没有推进，防止死循环（参考 _rest_backfill_range）
@@ -2915,11 +2929,14 @@ def cmd_analyze_signals(args):
                 
                 cursor = next_cursor
                 
+                # 打印批次信息（无论是否继续）
+                print(f"  已获取批次 {batch_count}，保存了 {batch_new_count} 根，时间范围: {datetime.fromtimestamp(min_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')} 至 {datetime.fromtimestamp(max_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}，下一批游标: {datetime.fromtimestamp(next_cursor/1000).strftime('%Y-%m-%d %H:%M:%S')}")
+                
                 # 如果返回的K线少于1000根，说明已到达边界
                 if len(candles) < 1000:
+                    print_info(f"批次 {batch_count}：返回的K线少于1000根（{len(candles)}根），已到达边界")
                     break
                 
-                print(f"  已获取批次 {batch_count}，保存了 {batch_new_count} 根，时间范围: {datetime.fromtimestamp(min_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')} 至 {datetime.fromtimestamp(max_start_ms/1000).strftime('%Y-%m-%d %H:%M:%S')}，下一批游标: {datetime.fromtimestamp(next_cursor/1000).strftime('%Y-%m-%d %H:%M:%S')}")
                 time.sleep(0.2)  # 避免 API 限流
                 
             except Exception as e:
