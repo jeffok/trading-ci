@@ -2832,12 +2832,35 @@ def cmd_analyze_signals(args):
                 if not candles:
                     break
                 
-                # 转换为正序并保存
+                if not candles:
+                    break
+                
+                # Bybit API 返回的是逆序（从新到旧），需要反转为正序
+                # reversed 后：candles[0] 是最旧的，candles[-1] 是最新的
                 candles = list(reversed(candles))
+                
+                # 找到本批次中最新（最大）的时间戳（用于推进游标）
+                batch_valid_candles = []
+                max_start_ms = None
+                
                 for c in candles:
                     c_start_ms = int(c["start_ms"])
+                    # 只处理时间范围内的数据
                     if c_start_ms < start_ms or c_start_ms > end_ms:
                         continue
+                    
+                    batch_valid_candles.append(c)
+                    if max_start_ms is None or c_start_ms > max_start_ms:
+                        max_start_ms = c_start_ms
+                
+                # 如果没有有效数据，说明已超出范围
+                if not batch_valid_candles or max_start_ms is None:
+                    break
+                
+                # 保存有效数据到数据库
+                batch_new_count = 0
+                for c in batch_valid_candles:
+                    c_start_ms = int(c["start_ms"])
                     
                     # 计算 close_time_ms
                     if interval.isdigit():
@@ -2860,14 +2883,27 @@ def cmd_analyze_signals(args):
                         turnover=c.get("turnover"),
                         source="bybit_rest_history",
                     )
+                    batch_new_count += 1
                 
-                all_candles.extend(candles)
+                all_candles.extend(batch_valid_candles)
                 
-                # 更新游标
-                last_start_ms = int(candles[-1]["start_ms"])
-                cursor = last_start_ms + tf_ms
+                # 更新游标：使用本批次中最大（最新）的时间戳 + 1个周期
+                # 这样下次获取时会从下一根K线开始
+                next_cursor = max_start_ms + tf_ms
                 
-                if len(candles) < 1000:  # 已获取完
+                # 如果游标已经超过结束时间，说明已获取完
+                if next_cursor > end_ms:
+                    break
+                
+                # 如果游标没有推进，防止死循环
+                if next_cursor <= cursor:
+                    print_warning(f"批次 {batch_count}：游标未推进（{cursor} -> {next_cursor}），可能已获取完所有数据")
+                    break
+                
+                cursor = next_cursor
+                
+                # 如果返回的K线少于1000根，说明已到达边界
+                if len(candles) < 1000:
                     break
                 
                 print(f"  已获取批次 {batch_count}，当前游标: {datetime.fromtimestamp(cursor/1000).strftime('%Y-%m-%d %H:%M:%S')}")
