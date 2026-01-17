@@ -22,9 +22,11 @@ try:
     import redis
     from libs.common.config import settings
     from libs.common.time import now_ms
+    from libs.common.timeframe import timeframe_ms
     from libs.db.pg import get_conn
     from libs.bybit.market_rest import BybitMarketRestClient
     from libs.bybit.trade_rest_v5 import TradeRestV5Client
+    from libs.bybit.intervals import bybit_interval_for_system_timeframe
 except ImportError as e:
     print(f"❌ 导入错误: {e}")
     print("\n💡 提示：在 Docker 容器中运行：")
@@ -2638,6 +2640,404 @@ def cmd_replay_report(args):
     
     print_success(f"报告已生成: {out_md}, {out_json}")
 
+# ==================== 历史信号分析功能 ====================
+
+def cmd_analyze_signals(args):
+    """历史信号分析命令：分析过去指定年数的策略信号出现次数"""
+    print("=" * 60)
+    print("  历史信号分析")
+    print("=" * 60)
+    print()
+    
+    try:
+        from datetime import datetime, timedelta
+        from libs.strategy.divergence import detect_three_segment_divergence
+        from libs.strategy.confluence import Candle, vegas_state, engulfing, rsi_divergence, obv_divergence, fvg_proximity
+        from services.strategy.repo import get_bars_range
+        from services.marketdata.repo_bars import upsert_bar
+    except ImportError as e:
+        print_error(f"导入失败: {e}")
+        sys.exit(1)
+    
+    symbol = args.symbol.upper()
+    tf = args.timeframe
+    
+    # 策略类型处理
+    strategy_filter = args.strategy.strip().upper() if args.strategy else None
+    strategy_filter_confirmations = None
+    
+    if strategy_filter:
+        if strategy_filter == "ALL":
+            strategy_filter = None  # None 表示不筛选
+        elif strategy_filter != "MACD_3SEG_DIVERGENCE":
+            # 检查是否是确认项组合（如 "ENGULFING+RSI_DIV"）
+            valid_confirmations = {"ENGULFING", "RSI_DIV", "OBV_DIV", "FVG_PROXIMITY"}
+            parts = strategy_filter.split("+")
+            if all(p in valid_confirmations for p in parts):
+                strategy_filter_confirmations = set(parts)
+            else:
+                print_warning(f"未识别的策略类型或确认项组合: {strategy_filter}")
+                print_info("支持的策略类型:")
+                print("  - ALL: 分析所有策略（默认）")
+                print("  - MACD_3SEG_DIVERGENCE: MACD 三段背离策略")
+                print("  - 确认项组合（如 ENGULFING+RSI_DIV）: 按确认项组合筛选")
+                print("    支持的确认项: ENGULFING, RSI_DIV, OBV_DIV, FVG_PROXIMITY")
+                print()
+    
+    strategy_name_display = (strategy_filter if strategy_filter else "ALL（所有策略）")
+    print_info(f"策略筛选: {strategy_name_display}")
+    
+    # 计算时间范围（过去 N 年）
+    years = args.years
+    end_time = datetime.now()
+    start_time = end_time - timedelta(days=years * 365)
+    
+    start_ms = int(start_time.timestamp() * 1000)
+    end_ms = int(end_time.timestamp() * 1000)
+    
+    print_info(f"Symbol: {symbol}")
+    print_info(f"Timeframe: {tf}")
+    print_info(f"时间范围: {start_time.strftime('%Y-%m-%d %H:%M:%S')} 至 {end_time.strftime('%Y-%m-%d %H:%M:%S')} (过去 {years} 年)")
+    print()
+    
+    # 1. 检查数据库中是否有数据，如果没有则从 Bybit API 获取
+    print_info("检查数据库中的历史数据...")
+    bars = get_bars_range(settings.database_url, symbol=symbol, timeframe=tf, start_close_time_ms=start_ms, end_close_time_ms=end_ms)
+    
+    # 计算需要的 bar 数量（估算）
+    tf_ms = timeframe_ms(tf)
+    estimated_bars = int((end_ms - start_ms) / tf_ms) + 100  # 加一些余量
+    
+    if len(bars) < estimated_bars * 0.8:  # 如果缺少超过20%的数据，尝试从 API 获取
+        print_warning(f"数据库中的数据可能不完整: 找到 {len(bars)} 根，预计需要约 {estimated_bars} 根")
+        
+        if args.fetch_from_api:
+            print_info("从 Bybit API 获取历史数据...")
+            interval = bybit_interval_for_system_timeframe(tf)
+            if not interval:
+                print_error(f"不支持的 timeframe: {tf}（无法映射到 Bybit interval）")
+                sys.exit(1)
+            
+            rest = BybitMarketRestClient(settings.bybit_base_url)
+            
+            # 分批获取（Bybit API 限制每次最多 1000 根）
+            all_candles = []
+            cursor = start_ms
+            batch_count = 0
+            max_batches = 200  # 安全限制
+            
+            while cursor < end_ms and batch_count < max_batches:
+                batch_count += 1
+                try:
+                    candles = rest.get_kline(
+                        symbol=symbol,
+                        interval=interval,
+                        category="linear",
+                        start_ms=cursor,
+                        end_ms=end_ms,
+                        limit=1000,
+                    )
+                    if not candles:
+                        break
+                    
+                    # 转换为正序并保存
+                    candles = list(reversed(candles))
+                    for c in candles:
+                        c_start_ms = int(c["start_ms"])
+                        if c_start_ms < start_ms or c_start_ms > end_ms:
+                            continue
+                        
+                        # 计算 close_time_ms
+                        if interval.isdigit():
+                            c_close_ms = c_start_ms + int(interval) * 60 * 1000 - 1
+                        else:
+                            c_close_ms = c_start_ms
+                        
+                        # 保存到数据库
+                        upsert_bar(
+                            settings.database_url,
+                            symbol=symbol,
+                            timeframe=tf,
+                            open_time_ms=c_start_ms,
+                            close_time_ms=c_close_ms,
+                            open=float(c["open"]),
+                            high=float(c["high"]),
+                            low=float(c["low"]),
+                            close=float(c["close"]),
+                            volume=float(c["volume"]),
+                            turnover=c.get("turnover"),
+                            source="bybit_rest_history",
+                        )
+                    
+                    all_candles.extend(candles)
+                    
+                    # 更新游标
+                    last_start_ms = int(candles[-1]["start_ms"])
+                    cursor = last_start_ms + tf_ms
+                    
+                    if len(candles) < 1000:  # 已获取完
+                        break
+                    
+                    print(f"  已获取批次 {batch_count}，当前游标: {datetime.fromtimestamp(cursor/1000).strftime('%Y-%m-%d %H:%M:%S')}")
+                    time.sleep(0.2)  # 避免 API 限流
+                    
+                except Exception as e:
+                    print_error(f"获取批次 {batch_count} 失败: {e}")
+                    break
+            
+            print_success(f"从 API 获取并保存了约 {len(all_candles)} 根 K 线")
+            print()
+            
+            # 重新从数据库读取
+            bars = get_bars_range(settings.database_url, symbol=symbol, timeframe=tf, start_close_time_ms=start_ms, end_close_time_ms=end_ms)
+        else:
+            print_warning("使用数据库现有数据进行分析（可能不完整）")
+            print_info("提示: 使用 --fetch-from-api 参数可以从 Bybit API 获取完整历史数据")
+            print()
+    
+    print_info(f"数据库中找到 {len(bars)} 根 K 线")
+    
+    if len(bars) < 200:
+        print_error(f"数据量不足: 至少需要 200 根 K 线，当前只有 {len(bars)} 根")
+        sys.exit(1)
+    
+    # 2. 对每个 bar 运行策略逻辑（从第 120 根开始，因为需要足够的历史数据）
+    print_info("开始分析策略信号...")
+    print()
+    
+    signals: List[Dict[str, Any]] = []
+    min_bars_needed = 120
+    
+    # 使用滑动窗口分析
+    for i in range(min_bars_needed, len(bars)):
+        # 获取最近 500 根 bars（策略需要）
+        window_bars = bars[max(0, i - 499):i + 1]
+        
+        if len(window_bars) < min_bars_needed:
+            continue
+        
+        current_bar = bars[i]
+        candles = [Candle(open=b["open"], high=b["high"], low=b["low"], close=b["close"], volume=b["volume"]) for b in window_bars]
+        close = [c.close for c in candles]
+        high = [c.high for c in candles]
+        low = [c.low for c in candles]
+        
+        # 1) 检测三段背离
+        setup = detect_three_segment_divergence(close=close, high=high, low=low)
+        if setup is None:
+            continue
+        
+        bias = setup.direction  # LONG/SHORT
+        
+        # 2) Vegas 强门槛（同向必须）
+        vs = vegas_state(close)
+        if bias == "LONG" and vs != "Bullish":
+            continue
+        if bias == "SHORT" and vs != "Bearish":
+            continue
+        
+        # 3) confirmations
+        hits: List[str] = []
+        if engulfing(candles[-2:], bias):
+            hits.append("ENGULFING")
+        if rsi_divergence(candles, bias):
+            hits.append("RSI_DIV")
+        if obv_divergence(candles, bias):
+            hits.append("OBV_DIV")
+        if fvg_proximity(candles, bias):
+            hits.append("FVG_PROXIMITY")
+        
+        if len(hits) < settings.min_confirmations:
+            continue
+        
+        # 策略类型标识（按确认项组合）
+        strategy_type = "MACD_3SEG_DIVERGENCE"
+        hits_key = "+".join(sorted(hits))  # 确认项组合作为策略变体标识
+        
+        # 策略筛选
+        if strategy_filter:
+            if strategy_filter != "ALL":
+                if strategy_filter_confirmations:
+                    # 按确认项组合筛选
+                    if not strategy_filter_confirmations.issubset(set(hits)):
+                        continue
+                elif strategy_filter != "MACD_3SEG_DIVERGENCE":
+                    # 其他策略类型（预留扩展）
+                    continue
+        
+        # 找到信号！
+        signal = {
+            "close_time_ms": current_bar["close_time_ms"],
+            "bias": bias,
+            "vegas_state": vs,
+            "hits": hits,
+            "hit_count": len(hits),
+            "price": current_bar["close"],
+            "strategy_type": strategy_type,
+            "strategy_variant": hits_key,  # 策略变体（确认项组合）
+        }
+        signals.append(signal)
+        
+        if len(signals) % 50 == 0:
+            print(f"  已分析 {i+1}/{len(bars)} 根 K 线，找到 {len(signals)} 个信号...")
+    
+    print_success(f"分析完成！共找到 {len(signals)} 个策略信号")
+    print()
+    
+    # 3. 统计报告
+    print("=" * 60)
+    print("  统计报告")
+    print("=" * 60)
+    print()
+    
+    # 按 bias 统计
+    long_count = sum(1 for s in signals if s["bias"] == "LONG")
+    short_count = sum(1 for s in signals if s["bias"] == "SHORT")
+    
+    print_info(f"总信号数: {len(signals)}")
+    print(f"  - LONG: {long_count} ({long_count*100/max(len(signals),1):.1f}%)")
+    print(f"  - SHORT: {short_count} ({short_count*100/max(len(signals),1):.1f}%)")
+    print()
+    
+    # 按确认项统计
+    confirmation_counts = {}
+    for s in signals:
+        for hit in s["hits"]:
+            confirmation_counts[hit] = confirmation_counts.get(hit, 0) + 1
+    
+    print_info("确认项统计:")
+    for hit, count in sorted(confirmation_counts.items(), key=lambda x: -x[1]):
+        print(f"  - {hit}: {count} ({count*100/max(len(signals),1):.1f}%)")
+    print()
+    
+    # 按 hit_count 统计
+    hit_count_stats = {}
+    for s in signals:
+        cnt = s["hit_count"]
+        hit_count_stats[cnt] = hit_count_stats.get(cnt, 0) + 1
+    
+    print_info("确认项数量分布:")
+    for cnt in sorted(hit_count_stats.keys()):
+        print(f"  - {cnt} 个确认项: {hit_count_stats[cnt]} 个信号 ({hit_count_stats[cnt]*100/max(len(signals),1):.1f}%)")
+    print()
+    
+    # 按策略变体（确认项组合）统计
+    strategy_variant_stats = {}
+    for s in signals:
+        variant = s.get("strategy_variant", "")
+        if not variant:
+            variant = "+".join(sorted(s.get("hits", [])))
+        strategy_variant_stats[variant] = strategy_variant_stats.get(variant, 0) + 1
+    
+    print_info("按策略变体（确认项组合）统计:")
+    for variant, count in sorted(strategy_variant_stats.items(), key=lambda x: -x[1]):
+        variant_display = variant if variant else "(无)"
+        print(f"  - {variant_display}: {count} 个信号 ({count*100/max(len(signals),1):.1f}%)")
+    print()
+    
+    # 按年/月统计
+    from collections import defaultdict
+    by_year_month = defaultdict(int)
+    for s in signals:
+        dt = datetime.fromtimestamp(s["close_time_ms"] / 1000)
+        key = f"{dt.year}-{dt.month:02d}"
+        by_year_month[key] += 1
+    
+    print_info("按年月分布:")
+    for key in sorted(by_year_month.keys()):
+        print(f"  - {key}: {by_year_month[key]} 个信号")
+    print()
+    if signals:
+        print_info("信号示例（前10个）:")
+        print()
+        print(f"{'序号':<6} {'日期时间':<20} {'K线周期':<10} {'方向':<8} {'价格':<12} {'策略变体':<40} {'确认项数量':<10}")
+        print("-" * 120)
+        for idx, s in enumerate(signals[:10], start=1):
+            dt = datetime.fromtimestamp(s["close_time_ms"] / 1000)
+            dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            variant = s.get("strategy_variant", "+".join(sorted(s.get("hits", []))))
+            variant_display = variant[:38] if len(variant) > 38 else variant
+            print(f"{idx:<6} {dt_str:<20} {tf:<10} {s['bias']:<8} {s['price']:<12.2f} {variant_display:<40} {s['hit_count']:<10}")
+        print()
+        
+        if args.show_all_signals:
+            print_info(f"所有信号详情（共 {len(signals)} 个）:")
+            print()
+            print(f"{'序号':<6} {'日期时间':<20} {'K线周期':<10} {'方向':<8} {'价格':<12} {'策略变体':<40} {'确认项':<60} {'Vegas状态':<12}")
+            print("-" * 180)
+            for idx, s in enumerate(signals, start=1):
+                dt = datetime.fromtimestamp(s["close_time_ms"] / 1000)
+                dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+                variant = s.get("strategy_variant", "+".join(sorted(s.get("hits", []))))
+                variant_display = variant[:38] if len(variant) > 38 else variant
+                hits_display = ", ".join(s.get("hits", []))[:58] if len(", ".join(s.get("hits", []))) > 58 else ", ".join(s.get("hits", []))
+                print(f"{idx:<6} {dt_str:<20} {tf:<10} {s['bias']:<8} {s['price']:<12.2f} {variant_display:<40} {hits_display:<60} {s.get('vegas_state', 'N/A'):<12}")
+            print()
+    
+    # 输出所有可选的策略类型
+    print_info("所有可用的策略类型:")
+    print("  1. MACD_3SEG_DIVERGENCE - MACD 三段背离策略（默认）")
+    print()
+    print_info("所有可用的确认项组合（策略变体）:")
+    all_confirmation_types = ["ENGULFING", "RSI_DIV", "OBV_DIV", "FVG_PROXIMITY"]
+    
+    # 生成所有可能的组合
+    from itertools import combinations
+    variant_examples = []
+    for r in range(2, len(all_confirmation_types) + 1):
+        for combo in combinations(all_confirmation_types, r):
+            combo_key = "+".join(sorted(combo))
+            # 检查这个组合是否在实际信号中出现
+            count = strategy_variant_stats.get(combo_key, 0)
+            variant_examples.append((combo_key, count))
+    
+    # 按出现频率排序
+    variant_examples.sort(key=lambda x: -x[1])
+    
+    print(f"  {'策略变体':<50} {'出现次数':<12} {'占比':<10}")
+    print(f"  {'-' * 70}")
+    for variant, count in variant_examples:
+        pct = count * 100 / max(len(signals), 1)
+        print(f"  {variant:<50} {count:<12} {pct:.1f}%")
+    print()
+    
+    # 4. 保存详细报告
+    Path("reports").mkdir(exist_ok=True)
+    ts = int(time.time())
+    report_path = Path("reports") / f"signal_analysis_{symbol}_{tf}_{years}years_{ts}.json"
+    
+    report_data = {
+        "symbol": symbol,
+        "timeframe": tf,
+        "years": years,
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+        "total_bars": len(bars),
+        "total_signals": len(signals),
+        "statistics": {
+            "by_bias": {
+                "LONG": long_count,
+                "SHORT": short_count,
+            },
+            "by_confirmations": confirmation_counts,
+            "by_hit_count": hit_count_stats,
+            "by_strategy_variant": dict(strategy_variant_stats),
+            "by_year_month": dict(by_year_month),
+        },
+        "strategy_filter": strategy_filter if strategy_filter else "ALL",
+        "signals": signals if args.show_all_signals or len(signals) <= 1000 else signals[-1000:],  # 如果显示所有信号或数量少，保存全部；否则保存最近1000个
+        "all_strategy_variants": [
+            {"variant": v, "count": c, "percentage": c*100/max(len(signals),1)}
+            for v, c in sorted(strategy_variant_stats.items(), key=lambda x: -x[1])
+        ],
+    }
+    
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report_data, f, ensure_ascii=False, indent=2)
+    
+    print_success(f"详细报告已保存: {report_path}")
+    print()
+
 # ==================== 基础设施初始化功能 ====================
 
 def cmd_init_db():
@@ -2762,6 +3162,22 @@ def main():
   python -m scripts.trading_test_tool replay-report \\
     --symbol BTCUSDT --timeframe 60 --limit 2000
 
+  # 历史信号分析（分析过去3年的策略信号，所有策略）
+  python -m scripts.trading_test_tool analyze-signals \\
+    --symbol BTCUSDT --timeframe 1h --years 3
+
+  # 历史信号分析（从 API 获取数据）
+  python -m scripts.trading_test_tool analyze-signals \\
+    --symbol BTCUSDT --timeframe 1h --years 3 --fetch-from-api
+
+  # 历史信号分析（筛选特定策略变体：包含 ENGULFING 和 RSI_DIV）
+  python -m scripts.trading_test_tool analyze-signals \\
+    --symbol BTCUSDT --timeframe 1h --years 3 --strategy ENGULFING+RSI_DIV
+
+  # 历史信号分析（筛选 MACD 三段背离策略）
+  python -m scripts.trading_test_tool analyze-signals \\
+    --symbol BTCUSDT --timeframe 1h --years 3 --strategy MACD_3SEG_DIVERGENCE
+
   # 数据库迁移初始化
   python -m scripts.trading_test_tool init-db
 
@@ -2881,6 +3297,15 @@ def main():
     replay_report_parser.add_argument('--timeout-sec', type=int, default=300, help='等待超时时间（秒）')
     replay_report_parser.add_argument('--api-url', default='', help='可选：API 服务地址，用于获取 compare 信息')
     
+    # analyze-signals 命令
+    analyze_parser = subparsers.add_parser('analyze-signals', help='历史信号分析：分析过去N年的策略信号出现次数')
+    analyze_parser.add_argument('--symbol', required=True, help='交易对，如 BTCUSDT')
+    analyze_parser.add_argument('--timeframe', required=True, help='时间框架，如 1m/5m/15m/30m/1h/4h/1d')
+    analyze_parser.add_argument('--years', type=int, default=3, help='分析过去N年的数据（默认: 3）')
+    analyze_parser.add_argument('--fetch-from-api', action='store_true', help='如果数据库数据不完整，从 Bybit API 获取历史数据')
+    analyze_parser.add_argument('--strategy', default='', help='策略类型筛选（ALL/MACD_3SEG_DIVERGENCE 或确认项组合如 ENGULFING+RSI_DIV，默认: ALL）')
+    analyze_parser.add_argument('--show-all-signals', action='store_true', help='显示所有信号的详细信息（默认只显示前10个示例）')
+    
     # init-db 命令
     subparsers.add_parser('init-db', help='数据库迁移初始化（幂等）')
     
@@ -2928,6 +3353,8 @@ def main():
         cmd_backtest(args)
     elif args.command == 'replay-report':
         cmd_replay_report(args)
+    elif args.command == 'analyze-signals':
+        cmd_analyze_signals(args)
     elif args.command == 'init-db':
         cmd_init_db()
     elif args.command == 'init-streams':
